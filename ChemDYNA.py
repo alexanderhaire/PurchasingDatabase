@@ -160,9 +160,11 @@ LOCAL_SECRETS_PATHS = (
 _PROJECT_SECRETS_CACHE: dict | None = None
 RECENT_CORRECTION_LIMIT = 5
 CHAT_EVENT_LOG_FILENAME = "chat_events.jsonl"
+SELF_SIGNUP_STORE_PATH = APP_ROOT / ".streamlit" / "self_signup_users.json"
 AUTH_USER_STATE_KEY = "auth_user"
 AUTH_ERROR_STATE_KEY = "auth_error"
 AUTH_TIMESTAMP_STATE_KEY = "auth_last_authenticated"
+SELF_SIGNUP_SUCCESS_STATE_KEY = "self_signup_success"
 USER_STATE_SUFFIX_DELIMITER = "__"
 USER_SCOPED_STATE_BASE_KEYS = [
     CHAT_HISTORY_KEY,
@@ -212,7 +214,8 @@ def resolve_auth_context() -> AuthContext:
     """
 
     config = load_auth_config()
-    registry = build_auth_registry(config)
+    signup_users = load_self_signup_users()
+    registry = build_auth_registry(config, signup_users)
     return {
         "registry": registry,
         "required": is_authentication_required(config, registry),
@@ -706,6 +709,25 @@ def build_connection_string() -> tuple[str, str, str, str]:
     database = secrets_config.get("database", DEFAULT_DATABASE)
     auth_mode = secrets_config.get("authentication", "windows").lower()
 
+    driver_label = str(driver).lower()
+
+    def security_clause() -> str:
+        """
+        Driver 18 enables encryption by default; allow local runs to disable verification unless secrets override.
+        """
+
+        encrypt_setting = secrets_config.get("encrypt")
+        trust_setting = secrets_config.get("trust_server_certificate")
+        if "driver 18" in driver_label:
+            encrypt_setting = encrypt_setting if encrypt_setting is not None else "no"
+            trust_setting = trust_setting if trust_setting is not None else "yes"
+        parts: list[str] = []
+        if encrypt_setting is not None:
+            parts.append(f"Encrypt={encrypt_setting};")
+        if trust_setting is not None:
+            parts.append(f"TrustServerCertificate={trust_setting};")
+        return "".join(parts)
+
     if auth_mode == "sql":
         username = secrets_config.get("username") or secrets_config.get("uid")
         password = secrets_config.get("password") or secrets_config.get("pwd")
@@ -718,6 +740,7 @@ def build_connection_string() -> tuple[str, str, str, str]:
             f"Server={server};"
             f"Database={database};"
             f"UID={username};PWD={password};"
+            f"{security_clause()}"
         )
         return conn_str, server, database, "SQL user credentials"
 
@@ -727,6 +750,7 @@ def build_connection_string() -> tuple[str, str, str, str]:
         f"Server={server};"
         f"Database={database};"
         f"Trusted_Connection={trusted_flag};"
+        f"{security_clause()}"
     )
     label = "Windows authentication"
     if using_local_defaults:
@@ -837,13 +861,16 @@ def normalize_auth_users(config: dict) -> list[dict]:
     return entries
 
 
-def build_auth_registry(config: dict) -> dict[str, dict]:
+def build_auth_registry(config: dict, extra_users: list[dict] | None = None) -> dict[str, dict]:
     """
     Return {login_identifier: user_entry} with passwords retained for verification.
     """
 
     registry: dict[str, dict] = {}
-    for entry in normalize_auth_users(config):
+    entries = normalize_auth_users(config)
+    if extra_users:
+        entries.extend(entry for entry in extra_users if isinstance(entry, dict))
+    for entry in entries:
         password_marker = entry.get("password") or entry.get("password_hash")
         if not password_marker:
             continue
@@ -893,6 +920,133 @@ def redact_user_payload(entry: dict) -> dict:
     return public
 
 
+def load_self_signup_users() -> list[dict]:
+    """
+    Return self-service accounts stored on disk. Missing/invalid files return [].
+    """
+
+    path = SELF_SIGNUP_STORE_PATH
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as err:
+        LOGGER.warning("Unable to read self-signup users: %s", err)
+        return []
+    if not isinstance(data, list):
+        return []
+    normalized: list[dict] = []
+    for entry in data:
+        if isinstance(entry, dict):
+            normalized.append(entry)
+    return normalized
+
+
+def save_self_signup_users(users: list[dict]) -> None:
+    """
+    Persist the provided users to disk as JSON.
+    """
+
+    try:
+        SELF_SIGNUP_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SELF_SIGNUP_STORE_PATH.write_text(json.dumps(users, indent=2), encoding="utf-8")
+    except OSError as err:
+        LOGGER.warning("Unable to save self-signup users: %s", err)
+        raise
+
+
+def register_self_signup_user(
+    work_email: str, password: str, existing_handles: set[str] | None = None
+) -> dict:
+    """
+    Create a new credentialed user sourced from self-service signup.
+    """
+
+    email = (work_email or "").strip()
+    password = (password or "").strip()
+    if not email or "@" not in email:
+        raise ValueError("Enter a valid work email.")
+    if not password or len(password) < 8:
+        raise ValueError("Password must be at least 8 characters long.")
+
+    canonical_email = email.lower()
+    username = canonical_email
+    if existing_handles and canonical_email in existing_handles:
+        raise ValueError("An account already exists for that email.")
+
+    users = load_self_signup_users()
+    for entry in users:
+        entry_email = str(entry.get("email") or "").lower()
+        if entry_email == canonical_email:
+            raise ValueError("An account already exists for that email.")
+
+    timestamp = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    hashed = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    new_entry = {
+        "id": canonical_email,
+        "email": email,
+        "username": username,
+        "name": email,
+        "password_hash": hashed,
+        "created_at": timestamp,
+        "created_via": "self_signup",
+    }
+    users.append(new_entry)
+    save_self_signup_users(users)
+    return new_entry
+
+
+def render_self_signup_form(registry_handles: set[str], login_prefill: str | None = None) -> None:
+    """
+    Render an inline form that lets new users create an account with only email + password.
+    """
+
+    st.divider()
+    st.caption("Need an account? Create one with your work email.")
+
+    success_message = st.session_state.pop(SELF_SIGNUP_SUCCESS_STATE_KEY, None)
+    if success_message:
+        st.success(success_message)
+
+    default_email = login_prefill if login_prefill and "@" in login_prefill else ""
+    with st.form("self_signup_form"):
+        signup_email = st.text_input("Work email", value=default_email)
+        signup_password = st.text_input("Create a password", type="password")
+        submitted = st.form_submit_button("Create account", use_container_width=True)
+
+    if not submitted:
+        return
+
+    errors: list[str] = []
+    if not signup_email.strip():
+        errors.append("Work email is required.")
+    elif "@" not in signup_email:
+        errors.append("Enter a valid work email.")
+    if not signup_password.strip():
+        errors.append("Password is required.")
+
+    if errors:
+        for err in errors:
+            st.error(err)
+        return
+
+    try:
+        new_entry = register_self_signup_user(signup_email, signup_password, registry_handles)
+    except ValueError as err:
+        st.error(str(err))
+        return
+    except OSError:
+        st.error("Unable to save your account right now. Please try again shortly.")
+        return
+
+    public_user = redact_user_payload(new_entry)
+    st.session_state[AUTH_USER_STATE_KEY] = public_user
+    st.session_state[AUTH_TIMESTAMP_STATE_KEY] = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    st.session_state.pop(AUTH_ERROR_STATE_KEY, None)
+    st.session_state[SELF_SIGNUP_SUCCESS_STATE_KEY] = "Account created! You're now signed in."
+    st.rerun()
+
+
 def ensure_authenticated_user() -> dict:
     """
     Return the signed-in user, prompting for credentials when required.
@@ -913,6 +1067,7 @@ def ensure_authenticated_user() -> dict:
         return user
 
     auth_error = st.session_state.pop(AUTH_ERROR_STATE_KEY, None)
+    registry_handles = set(registry.keys())
     st.title("Chemical Dynamics")
     st.subheader("Sign in to continue")
     login_value = st.text_input("Work email or username")
@@ -931,6 +1086,7 @@ def ensure_authenticated_user() -> dict:
             st.session_state[AUTH_USER_STATE_KEY] = public_user
             st.session_state[AUTH_TIMESTAMP_STATE_KEY] = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
             st.session_state.pop(AUTH_ERROR_STATE_KEY, None)
+            st.session_state.pop(SELF_SIGNUP_SUCCESS_STATE_KEY, None)
             st.rerun()
         else:
             st.session_state[AUTH_ERROR_STATE_KEY] = "Invalid username or password."
@@ -938,7 +1094,7 @@ def ensure_authenticated_user() -> dict:
 
     if auth_error:
         st.error(auth_error)
-    st.info("Contact your administrator if you need access.")
+    render_self_signup_form(registry_handles, login_value)
     st.stop()
 
 
@@ -3299,7 +3455,7 @@ current_user = ensure_authenticated_user()
 
 st.title("Chemical Dynamics")
 st.write(
-    "To Help you Grow"
+    "To Help you Grow "
     "Interpreter handles the reasoning and logic, then the app runs the SQL locally and securely."
 )
 
