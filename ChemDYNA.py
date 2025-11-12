@@ -11,6 +11,7 @@ import math
 import re
 import uuid
 from collections.abc import Iterable, Mapping
+from numbers import Number
 from pathlib import Path
 from typing import TypedDict
 
@@ -148,7 +149,7 @@ RESET_COMMANDS = {"reset", "clear", "clear chat", "restart"}
 CORRECTION_PREFIXES = ("correction:", "fix:")
 CORRECTION_PROMPT_FOOTER = "If this isn’t what you meant, tell me what to fix (e.g., 'use December too' or 'wrong intent')."
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
+OPENAI_DEFAULT_MODEL = "gpt-5.0"
 OPENAI_TIMEOUT_SECONDS = 15
 OPENAI_EMBEDDING_URL = "https://api.openai.com/v1/embeddings"
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
@@ -1245,7 +1246,58 @@ def normalize_periods_list(raw_periods: Iterable | None) -> list[tuple[int, int]
     return normalized
 
 
+NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
 MAX_USAGE_PERIODS = 6
+DEFAULT_USAGE_HISTORY_MONTHS = 3
+
+
+class UsagePeriod(TypedDict):
+    label: str
+    start_date: datetime.date
+    end_date: datetime.date
+    granularity: str
+    month: int | None
+    year: int
+
+
+def extract_recent_month_count(text: str, max_months: int = MAX_USAGE_PERIODS) -> int | None:
+    """
+    Return the number of trailing months referenced by phrases such as 'past 3 months'.
+    """
+
+    if not text:
+        return None
+    lowered = text.lower()
+    digit_match = re.search(r"(?:past|last)\s+(\d{1,2})(?:\s+months?|\s+mos?\b)", lowered)
+    if digit_match:
+        try:
+            value = int(digit_match.group(1))
+            if 1 <= value <= max_months:
+                return value
+        except ValueError:
+            pass
+
+    word_pattern = r"(?:past|last)\s+(" + "|".join(NUMBER_WORDS.keys()) + r")(?:\s+months?)?"
+    word_match = re.search(word_pattern, lowered)
+    if word_match:
+        value = NUMBER_WORDS.get(word_match.group(1))
+        if value and 1 <= value <= max_months:
+            return value
+    return None
 
 
 def deduplicate_periods(periods: Iterable[tuple[int, int]] | None, limit: int = MAX_USAGE_PERIODS) -> list[tuple[int, int]]:
@@ -1329,29 +1381,123 @@ def extract_periods_from_prompt(prompt: str, default_year: int) -> list[tuple[in
     return periods
 
 
-def determine_usage_periods(prompt: str, context: dict | None, today: datetime.date) -> list[tuple[int, int]]:
+def extract_year_mentions(prompt: str) -> list[int]:
+    if not prompt:
+        return []
+    years: list[int] = []
+    for match in YEAR_TOKEN_REGEX.finditer(prompt):
+        token = match.group(0)
+        try:
+            value = int(token)
+        except (TypeError, ValueError):
+            continue
+        if 1900 <= value <= 2100 and value not in years:
+            years.append(value)
+    return years
+
+
+def build_month_usage_period(month: int, year: int) -> UsagePeriod:
+    start_date, end_date = month_date_range(month, year)
+    label = start_date.strftime("%B %Y")
+    return {
+        "label": label,
+        "start_date": start_date,
+        "end_date": end_date,
+        "granularity": "month",
+        "month": month,
+        "year": year,
+    }
+
+
+def build_year_usage_period(year: int) -> UsagePeriod:
+    start_date = datetime.date(year, 1, 1)
+    end_date = datetime.date(year, 12, 31)
+    label = f"{year} (Jan-Dec)"
+    return {
+        "label": label,
+        "start_date": start_date,
+        "end_date": end_date,
+        "granularity": "year",
+        "month": None,
+        "year": year,
+    }
+
+
+def resolve_year_span_periods(prompt: str, context: dict | None, today: datetime.date) -> list[UsagePeriod]:
+    years = extract_year_mentions(prompt)
+    if isinstance(context, dict):
+        entities = context.get("entities") or {}
+        for bucket_key in ("periods", "comparison_periods"):
+            bucket = entities.get(bucket_key)
+            if not isinstance(bucket, Iterable) or isinstance(bucket, (str, bytes)):
+                continue
+            for entry in bucket:
+                if not isinstance(entry, Mapping):
+                    continue
+                month_val = entry.get("month") or entry.get("Month")
+                year_val = entry.get("year") or entry.get("Year")
+                if month_val:
+                    continue
+                if year_val is None:
+                    continue
+                try:
+                    year_int = int(year_val)
+                except (TypeError, ValueError):
+                    continue
+                years.append(year_int)
+        if context.get("mentions_last_year"):
+            years.append(today.year - 1)
+        if context.get("mentions_this_year"):
+            years.append(today.year)
+    normalized: list[int] = []
+    for year in years:
+        try:
+            year_int = int(year)
+        except (TypeError, ValueError):
+            continue
+        if not (1900 <= year_int <= 2100):
+            continue
+        if year_int in normalized:
+            continue
+        normalized.append(year_int)
+        if len(normalized) >= MAX_USAGE_PERIODS:
+            break
+    return [build_year_usage_period(year) for year in normalized]
+
+
+def determine_usage_periods(prompt: str, context: dict | None, today: datetime.date) -> list[UsagePeriod]:
     """
-    Combine LLM entities, explicit prompt months, and fallbacks to decide which periods to query.
+    Combine LLM entities, explicit prompt months, and fallbacks (including whole-year spans) to decide which periods to query.
     """
 
     if not isinstance(context, dict):
         month_guess, year_guess = infer_period_from_text(prompt, today)
-        return [(month_guess, year_guess)]
+        return [build_month_usage_period(month_guess, year_guess)]
 
     entities = context.get("entities") or {}
     entity_periods = normalize_periods_list(entities.get("periods")) or normalize_periods_list(
         entities.get("comparison_periods")
     )
     prompt_periods = context.get("prompt_periods") or []
-    candidates = entity_periods or prompt_periods
-    if not candidates:
-        month_val = context.get("month")
-        year_val = context.get("year")
-        if not month_val or not year_val:
-            month_val, year_val = infer_period_from_text(prompt, today)
-        candidates = [(month_val, year_val)]
+    candidate_pairs = deduplicate_periods(entity_periods or prompt_periods, limit=MAX_USAGE_PERIODS)
+    if candidate_pairs:
+        return [build_month_usage_period(month_val, year_val) for month_val, year_val in candidate_pairs]
 
-    return deduplicate_periods(candidates, limit=MAX_USAGE_PERIODS)
+    year_span_periods = resolve_year_span_periods(prompt, context, today)
+    if year_span_periods:
+        return year_span_periods
+
+    month_val = context.get("month")
+    year_val = context.get("year")
+    try:
+        month_int = int(month_val) if month_val is not None else None
+        year_int = int(year_val) if year_val is not None else None
+    except (TypeError, ValueError):
+        month_int = None
+        year_int = None
+    if not month_int or not year_int:
+        month_int, year_int = infer_period_from_text(prompt, today)
+    return [build_month_usage_period(month_int, year_int)]
 
 
 def suggest_items_by_description(
@@ -2165,7 +2311,7 @@ def handle_usage_question(
     periods = determine_usage_periods(prompt, context, today) or []
     if not periods:
         month_guess, year_guess = infer_period_from_text(prompt, today)
-        periods = [(month_guess, year_guess)]
+        periods = [build_month_usage_period(month_guess, year_guess)]
 
     rows: list[dict] = []
     period_details: list[dict] = []
@@ -2174,14 +2320,19 @@ def handle_usage_question(
     combined_end: datetime.date | None = None
     total_usage = 0.0
 
-    for period_month, period_year in periods:
-        start_date, end_date = month_date_range(period_month, period_year)
+    for period in periods:
+        start_date = period.get("start_date")
+        end_date = period.get("end_date")
+        label = period.get("label")
+        if not isinstance(start_date, datetime.date) or not isinstance(end_date, datetime.date):
+            continue
+        display_label = label or start_date.strftime("%B %Y")
         usage_value = fetch_usage(cursor, item_code, start_date, end_date)
         combined_start = start_date if combined_start is None else min(combined_start, start_date)
         combined_end = end_date if combined_end is None else max(combined_end, end_date)
         row_entry = {
             "Item": item_code,
-            "Period": start_date.strftime("%B %Y"),
+            "Period": display_label,
             "StartDate": start_date.isoformat(),
             "EndDate": end_date.isoformat(),
             "Usage": usage_value,
@@ -2189,7 +2340,13 @@ def handle_usage_question(
         if item_description:
             row_entry["Description"] = item_description
         rows.append(row_entry)
-        period_details.append({"label": start_date.strftime("%B %Y"), "usage": usage_value})
+        period_details.append(
+            {
+                "label": display_label,
+                "usage": usage_value,
+                "granularity": period.get("granularity"),
+            }
+        )
         total_usage += usage_value
         sql_previews.append(format_sql_preview(USAGE_QUERY, (item_code, start_date, end_date)))
 
@@ -2514,8 +2671,21 @@ def handle_inventory_question(cursor: pyodbc.Cursor, prompt: str, context: dict 
     }
 
 
-def handle_reorder_question(cursor: pyodbc.Cursor) -> dict:
-    cursor.execute(REORDER_QUERY)
+def handle_reorder_question(
+    cursor: pyodbc.Cursor, prompt: str, today: datetime.date, context: dict | None = None
+) -> dict:
+    context = context or {}
+    item_code = resolve_item_from_context(prompt, context)
+    params: list = []
+    query = REORDER_QUERY
+    if item_code:
+        query = REORDER_QUERY.replace(
+            "ORDER BY Shortfall DESC;",
+            "  AND i.ITEMNMBR = ?\nORDER BY Shortfall DESC;",
+        )
+        params.append(item_code)
+
+    cursor.execute(query, params)
     fetched = cursor.fetchall()
     rows = [
         {
@@ -2531,19 +2701,111 @@ def handle_reorder_question(cursor: pyodbc.Cursor) -> dict:
         }
         for row in fetched
     ]
+    sql_preview = format_sql_preview(query, params) if params else query
     insights = {
         "count": len(rows),
         "top_row": rows[0] if rows else None,
+        "item": item_code,
     }
+    suggestions: list[dict] = []
     error = None
     if not rows:
-        error = "All MAIN items meet their order points right now."
+        if item_code:
+            error = f"I could not find reorder data for {item_code} at MAIN."
+            suggestions = suggest_items_by_description(cursor, prompt)
+        else:
+            error = "All MAIN items meet their order points right now."
+        return {
+            "data": rows,
+            "sql": sql_preview,
+            "context_type": "reorder",
+            "insights": insights,
+            "error": error,
+            "suggestions": suggestions,
+        }
+
+    def coerce_number(value) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    trailing_months = extract_recent_month_count(prompt)
+    note_text = str(context.get("notes") or "")
+    trailing_months = trailing_months or extract_recent_month_count(note_text)
+    if trailing_months is None:
+        lowered_sources = [prompt.lower(), note_text.lower()]
+        if any("historical usage" in source for source in lowered_sources if source):
+            trailing_months = DEFAULT_USAGE_HISTORY_MONTHS
+    if trailing_months is None:
+        entity_periods = normalize_periods_list((context.get("entities") or {}).get("periods"))
+        if entity_periods:
+            trailing_months = min(len(entity_periods), MAX_USAGE_PERIODS)
+        elif context.get("prompt_period_count"):
+            try:
+                trailing_months = min(int(context["prompt_period_count"]), MAX_USAGE_PERIODS)
+            except (TypeError, ValueError):
+                trailing_months = None
+
+    usage_details = None
+    if (
+        item_code
+        and trailing_months
+        and isinstance(trailing_months, int)
+        and trailing_months > 0
+        and rows
+    ):
+        trailing_months = max(1, min(trailing_months, MAX_USAGE_PERIODS))
+        periods: list[tuple[datetime.date, datetime.date]] = []
+        month_cursor, year_cursor = today.month, today.year
+        for _ in range(trailing_months):
+            start_date, end_date = month_date_range(month_cursor, year_cursor)
+            periods.append((start_date, end_date))
+            month_cursor, year_cursor = previous_month(month_cursor, year_cursor)
+        periods.reverse()
+
+        usage_rows: list[dict] = []
+        total_usage = 0.0
+        for start_date, end_date in periods:
+            usage_value = abs(fetch_usage(cursor, item_code, start_date, end_date))
+            usage_rows.append(
+                {
+                    "Period": start_date.strftime("%B %Y"),
+                    "StartDate": start_date.isoformat(),
+                    "EndDate": end_date.isoformat(),
+                    "Usage": usage_value,
+                }
+            )
+            total_usage += usage_value
+
+        avg_usage = total_usage / trailing_months if trailing_months else None
+        top_row = rows[0]
+        avail_qty = coerce_number(top_row.get("Avail") or top_row.get("QtyAvailable"))
+        shortfall_value = coerce_number(top_row.get("Shortfall"))
+        cover_need = None
+        if avail_qty is not None:
+            cover_need = max(total_usage - max(avail_qty, 0.0), 0.0)
+        recommended_buy = None
+        candidates = [value for value in (shortfall_value, cover_need) if value is not None]
+        if candidates:
+            recommended_buy = max(candidates)
+        usage_details = {
+            "months": trailing_months,
+            "rows": usage_rows,
+            "total": total_usage,
+            "average": avg_usage,
+            "cover_need": cover_need,
+            "recommended_buy": recommended_buy,
+        }
+        insights["usage_based_recommendation"] = usage_details
+
     return {
         "data": rows,
-        "sql": REORDER_QUERY,
+        "sql": sql_preview,
         "context_type": "reorder",
         "insights": insights,
         "error": error,
+        "suggestions": suggestions,
     }
 
 
@@ -2694,6 +2956,55 @@ def describe_reorder_message(insights: dict | None) -> str:
     top_row = insights.get("top_row")
     if not isinstance(top_row, dict):
         top_row = {}
+    requested_item = insights.get("item")
+    if requested_item:
+        parts: list[str] = []
+        shortfall = top_row.get("Shortfall")
+        order_point = top_row.get("OrderPoint")
+        on_hand = top_row.get("OnHand")
+        avail = top_row.get("Avail")
+        on_order = top_row.get("OnOrder")
+        if isinstance(shortfall, Number) and isinstance(order_point, Number):
+            availability_note = None
+            if isinstance(on_hand, Number):
+                availability_note = f"{on_hand:,.0f} on hand today"
+            elif isinstance(avail, Number):
+                availability_note = f"{avail:,.0f} available today"
+            base_sentence = (
+                f"{requested_item} needs {abs(shortfall):,.0f} units to reach its {order_point:,.0f} order point"
+            )
+            if availability_note:
+                base_sentence += f" ({availability_note})."
+            else:
+                base_sentence += "."
+            if isinstance(on_order, Number) and on_order > 0:
+                base_sentence += f" {on_order:,.0f} already on order."
+            parts.append(base_sentence)
+        else:
+            parts.append(f"{requested_item} currently shows the largest shortfall.")
+
+        usage_info = insights.get("usage_based_recommendation") or {}
+        months = usage_info.get("months")
+        total_usage = usage_info.get("total")
+        avg_usage = usage_info.get("average")
+        cover_need = usage_info.get("cover_need")
+        recommended = usage_info.get("recommended_buy")
+        if months and total_usage is not None:
+            usage_sentence = f"Last {months} months consumed {total_usage:,.0f} units"
+            if avg_usage is not None:
+                usage_sentence += f" (~{avg_usage:,.0f}/month)"
+            usage_sentence += "."
+            parts.append(usage_sentence)
+            if cover_need is not None:
+                parts.append(
+                    f"Covering another {months} months would take about {cover_need:,.0f} additional units after today's availability."
+                )
+            if recommended is not None:
+                parts.append(
+                    f"I'd plan on ordering around {recommended:,.0f} units (max of usage coverage vs order-point shortfall)."
+                )
+        return " ".join(part for part in parts if part).strip()
+
     item = top_row.get("Item")
     shortfall = top_row.get("Shortfall")
     order_point = top_row.get("OrderPoint")
@@ -2806,7 +3117,7 @@ def handle_chat_prompt(
     if intent == "inventory":
         sql_payload = handle_inventory_question(cursor, prompt, context)
     elif intent == "reorder":
-        sql_payload = handle_reorder_question(cursor)
+        sql_payload = handle_reorder_question(cursor, prompt, today, context)
     elif intent == "compare":
         sql_payload = handle_compare_question(cursor, prompt, today, context)
     elif intent == "why_drop":
@@ -3283,6 +3594,7 @@ MONTH_NAME_REGEX = re.compile(
     r")\b(?:\s+(\d{2,4}))?",
     flags=re.IGNORECASE,
 )
+YEAR_TOKEN_REGEX = re.compile(r"\b(19|20)\d{2}\b")
 
 
 st.set_page_config(page_title="Adjustment Usage Explorer", page_icon="dY", layout="wide")
