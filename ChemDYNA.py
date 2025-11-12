@@ -1494,6 +1494,15 @@ CAPABILITY_QUESTION_PHRASES: tuple[str, ...] = (
     "what do you support",
     "what are you able to do",
     "what are some things you can do",
+    "what are some things i can ask",
+    "what questions can i ask",
+    "what should i ask",
+)
+
+SAMPLE_ITEM_SUGGESTIONS: tuple[str, ...] = (
+    "NO3MN",
+    "NO3CA12",
+    "AO4ADD",
 )
 
 
@@ -1572,6 +1581,56 @@ def describe_month_year(month: int | None, year: int | None, fallback_year: int)
     safe_year = year if year else fallback_year
     safe_year = max(1900, min(2100, safe_year))
     return datetime.date(safe_year, month, 1).strftime("%B %Y")
+
+
+def find_recent_data_context(history: list[dict]) -> dict | None:
+    """
+    Return the most recent assistant context that referenced an actual data pull.
+    """
+
+    for entry in reversed(history or []):
+        if entry.get("role") != "assistant":
+            continue
+        if entry.get("context_type") == "chitchat":
+            continue
+        context = entry.get("context")
+        if isinstance(context, dict):
+            item = context.get("item") or (context.get("entities") or {}).get("item")
+            if item:
+                return context
+    return None
+
+
+def build_question_suggestions(history: list[dict], limit: int = 3) -> list[str]:
+    """
+    Generate context-aware starter questions so capability prompts feel actionable.
+    """
+
+    suggestions: list[str] = []
+    today = datetime.date.today()
+    context = find_recent_data_context(history)
+    if context:
+        entities = context.get("entities") or {}
+        item = context.get("item") or entities.get("item")
+        if item:
+            base_month = context.get("month") or entities.get("month") or today.month
+            base_year = context.get("year") or entities.get("year") or today.year
+            base_label = describe_month_year(base_month, base_year, today.year)
+            suggestions.append(f"What was {item} usage for {base_label}?")
+            prev_month, prev_year = previous_month(base_month, base_year)
+            suggestions.append(
+                f"Compare {item} between {base_label} and {describe_month_year(prev_month, prev_year, today.year)}."
+            )
+            suggestions.append(f"Why did {item} usage change after {base_label}?")
+    if not suggestions:
+        sample_item = SAMPLE_ITEM_SUGGESTIONS[0]
+        current_label = describe_month_year(today.month, today.year, today.year)
+        suggestions = [
+            f"What was {sample_item} usage for {current_label}?",
+            f"Compare {sample_item} with the prior month.",
+            "Which items are below their reorder point right now?",
+        ]
+    return suggestions[:limit]
 
 
 FOLLOWUP_DATA_PHRASES: tuple[str, ...] = (
@@ -2044,12 +2103,16 @@ def latest_history_entry(history: list[dict], context_type: str | None = None) -
 def generate_chitchat_reply(prompt: str, history: list[dict]) -> str:
     lowered = prompt.lower()
     if asks_about_capabilities(prompt):
+        suggestions = build_question_suggestions(history or [])
+        suggestion_block = ""
+        if suggestions:
+            bullets = "\n".join(f"- {text}" for text in suggestions)
+            suggestion_block = f"\n\nTry asking:\n{bullets}"
         return (
             "I can pull GP usage for specific items, compare months or years, check current inventory, "
-            "and flag the biggest reorder gaps. Try prompts like \"Show NO3CA12 usage for March 2024,\" "
-            "\"Compare NO3CA12 this March versus last March,\" or "
-            "\"List items below their reorder point for the South Plant.\" "
+            "and flag the biggest reorder gaps. "
             "Just mention the item and timeframe you care about and I'll run the numbers."
+            f"{suggestion_block}"
         )
     reorder_entry = latest_history_entry(history, "reorder")
     if reorder_entry and any(word in lowered for word in ("gap", "shortfall", "worst", "order point", "buy")):
