@@ -17,6 +17,7 @@ from typing import Any, Callable, TypedDict
 
 import pyodbc
 import requests
+import pandas as pd
 import streamlit as st
 from dateutil import parser as date_parser
 from streamlit.errors import StreamlitAPIException, StreamlitSecretNotFoundError
@@ -95,6 +96,13 @@ CHAT_ITEM_STOPWORDS = {
     "NEED",
     "NEEDS",
     "NEEDED",
+    "BUY",
+    "BUYS",
+    "BUYING",
+    "PURCHASE",
+    "PURCHASES",
+    "PURCHASING",
+    "PURCHASED",
     "THANK",
     "THANKS",
     "ALSO",
@@ -145,6 +153,52 @@ ITEM_FOLLOWING_KEYWORDS = {
     "SHORTFALL",
     "SUMMARY",
 }
+
+GRAPH_SINGLE_TOKENS: set[str] = {
+    "graph",
+    "graphs",
+    "chart",
+    "charts",
+    "plot",
+    "plots",
+    "visual",
+    "visuals",
+    "visualize",
+    "visualise",
+    "visualized",
+    "visualised",
+    "visualization",
+    "visualisation",
+}
+GRAPH_MULTI_PHRASES: tuple[str, ...] = (
+    "line graph",
+    "line chart",
+    "bar graph",
+    "bar chart",
+    "trend graph",
+    "trend chart",
+    "graph it",
+    "chart it",
+    "make a graph",
+    "make a chart",
+    "show a graph",
+    "show the graph",
+)
+
+MONTH_KEYWORD_TOKENS = {
+    name.upper()
+    for name in list(calendar.month_name)[1:]
+    if name
+}
+MONTH_KEYWORD_TOKENS.update(
+    name.upper()
+    for name in list(calendar.month_abbr)[1:]
+    if name
+)
+# Accept both SEP and SEPT spellings so month references are filtered consistently.
+MONTH_KEYWORD_TOKENS.add("SEPT")
+
+YEAR_TOKEN_SUFFIXES: tuple[str, ...] = ("S", "ST", "ND", "RD", "TH")
 
 REORDER_ACTION_KEYWORDS: tuple[str, ...] = (
     "need to order",
@@ -1223,9 +1277,28 @@ def extract_item_candidates(prompt: str, limit: int = 5) -> list[str]:
     Return up to limit candidate item tokens using the same priority as extract_item_code.
     """
 
-    raw_tokens = ITEM_TOKEN_PATTERN.findall(prompt.upper())
+    upper_prompt = prompt.upper()
+    raw_tokens = ITEM_TOKEN_PATTERN.findall(upper_prompt)
     if not raw_tokens:
         return []
+
+    def looks_like_month_reference(token: str) -> bool:
+        return token in MONTH_KEYWORD_TOKENS
+
+    def year_digits(token: str) -> str | None:
+        if token.isdigit():
+            return token
+        for suffix in YEAR_TOKEN_SUFFIXES:
+            if token.endswith(suffix) and token[: -len(suffix)].isdigit():
+                return token[: -len(suffix)]
+        return None
+
+    def looks_like_year_reference(token: str) -> bool:
+        digits = year_digits(token)
+        if not digits or len(digits) != 4:
+            return False
+        value = int(digits)
+        return 1900 <= value <= 2100
 
     keyword_candidates: list[str] = []
     digit_candidates: list[str] = []
@@ -1246,6 +1319,10 @@ def extract_item_candidates(prompt: str, limit: int = 5) -> list[str]:
 
     for idx, token in enumerate(raw_tokens):
         if token in CHAT_ITEM_STOPWORDS:
+            continue
+        if looks_like_month_reference(token):
+            continue
+        if looks_like_year_reference(token):
             continue
         if has_digit(token):
             digit_candidates.append(token)
@@ -1782,6 +1859,7 @@ NUMBER_WORDS = {
 ZERO_USAGE_EPSILON = 1e-4
 
 MAX_USAGE_PERIODS = 6
+GRAPH_MAX_USAGE_PERIODS = 12
 DEFAULT_USAGE_HISTORY_MONTHS = 3
 
 
@@ -1995,17 +2073,37 @@ def determine_usage_periods(prompt: str, context: dict | None, today: datetime.d
         return [build_month_usage_period(month_guess, year_guess)]
 
     entities = context.get("entities") or {}
+    graph_requested = bool(context.get("graph_requested"))
+    period_limit = GRAPH_MAX_USAGE_PERIODS if graph_requested else MAX_USAGE_PERIODS
     entity_periods = normalize_periods_list(entities.get("periods")) or normalize_periods_list(
         entities.get("comparison_periods")
     )
     prompt_periods = context.get("prompt_periods") or []
-    candidate_pairs = deduplicate_periods(entity_periods or prompt_periods, limit=MAX_USAGE_PERIODS)
+    candidate_pairs = deduplicate_periods(entity_periods or prompt_periods, limit=period_limit)
     if candidate_pairs:
         return [build_month_usage_period(month_val, year_val) for month_val, year_val in candidate_pairs]
 
     year_span_periods = resolve_year_span_periods(prompt, context, today)
     if year_span_periods:
-        return year_span_periods
+        if graph_requested:
+            expanded: list[UsagePeriod] = []
+            for year_period in year_span_periods:
+                year_val = year_period.get("year")
+                try:
+                    year_int = int(year_val) if year_val is not None else None
+                except (TypeError, ValueError):
+                    year_int = None
+                if year_int is None:
+                    continue
+                for month in range(1, 13):
+                    expanded.append(build_month_usage_period(month, year_int))
+                    if len(expanded) >= period_limit:
+                        break
+                if len(expanded) >= period_limit:
+                    break
+            if expanded:
+                return expanded
+        return year_span_periods[:period_limit]
 
     month_val = context.get("month")
     year_val = context.get("year")
@@ -2574,6 +2672,16 @@ def contains_data_request_keywords(prompt: str) -> bool:
     return any(keyword in lowered for keyword in DATA_REQUEST_KEYWORDS)
 
 
+def wants_graph(prompt: str) -> bool:
+    normalized = " ".join(prompt.lower().split())
+    if not normalized:
+        return False
+    if any(phrase in normalized for phrase in GRAPH_MULTI_PHRASES):
+        return True
+    tokens = re.findall(r"[a-z]+", normalized)
+    return any(token in GRAPH_SINGLE_TOKENS for token in tokens)
+
+
 def mentions_plural_item_language(prompt: str) -> bool:
     lowered = prompt.lower()
     return any(re.search(rf"\b{re.escape(token)}\b", lowered) for token in PLURAL_ITEM_TOKENS)
@@ -2711,10 +2819,10 @@ def detect_multi_intent_usage_conflict(prompt: str) -> str | None:
     if inventory_needed:
         conflict_labels.append("inventory")
     conflict_text = " and ".join(conflict_labels)
+    primary_view = "reorder" if reorder_needed else "inventory"
     return (
-        f"That request mixes historical usage/sales with {conflict_text} criteria. "
-        "I can only run one template at a time, so please split it into separate questions "
-        "(for example, pull the usage or sales report first, then run an inventory or reorder check)."
+        f"You mentioned historical usage or sales along with {conflict_text} criteria, so I focused on the {primary_view} view first. "
+        "Run a separate usage or sales question if you also need the historical detail table."
     )
 
 
@@ -3028,10 +3136,6 @@ def build_clarification_question(intent: str, context: dict, today: datetime.dat
     """
     Decide whether we should ask the user clarifying questions before running SQL.
     """
-
-    multi_warning = context.get("multi_intent_warning")
-    if isinstance(multi_warning, str) and multi_warning.strip():
-        return multi_warning
 
     action = INTENT_ITEM_ACTIONS.get(intent)
     if not action:
@@ -3567,6 +3671,8 @@ def interpret_prompt(
     prior_session_intent = session_context.get("intent") if isinstance(session_context, dict) else None
     pending_item_intent = session_context.get("needs_item_for_intent") if isinstance(session_context, dict) else None
     month_guess, year_guess = infer_period_from_text(prompt, today)
+    item_followup_hint = looks_like_item_followup(prompt)
+    graph_requested = wants_graph(prompt)
     context = {
         "intent": classify_chat_intent(prompt),
         "item": extract_item_code(prompt),
@@ -3578,6 +3684,8 @@ def interpret_prompt(
         "prompt_has_item": False,
         "followup_same_data": references_previous_data(prompt),
         "multi_intent_warning": detect_multi_intent_usage_conflict(prompt),
+        "item_followup_hint": item_followup_hint,
+        "graph_requested": graph_requested,
     }
     prompt_item_present = bool(context["item"])
     prompt_has_data_keywords = contains_data_request_keywords(prompt)
@@ -3603,8 +3711,9 @@ def interpret_prompt(
             context["intent"] = multi_scope_intent
     context["prompt_has_item"] = prompt_item_present
     context["prompt_item_candidates"] = extract_item_candidates(prompt)
+    period_limit = GRAPH_MAX_USAGE_PERIODS if graph_requested else MAX_USAGE_PERIODS
     raw_periods = extract_periods_from_prompt(prompt, today.year)
-    prompt_periods = deduplicate_periods(raw_periods, limit=MAX_USAGE_PERIODS)
+    prompt_periods = deduplicate_periods(raw_periods, limit=period_limit)
     context["prompt_periods"] = prompt_periods
     context["prompt_period_count"] = len(prompt_periods)
     context["prompt_period_labels"] = [
@@ -3621,9 +3730,7 @@ def interpret_prompt(
             pending_item_intent = None
         elif prompt_item_present:
             context["needs_item_for_intent"] = None
-    followup_item_response = bool(
-        pending_item_intent and prompt_item_present and looks_like_item_followup(prompt)
-    )
+    followup_item_response = bool(pending_item_intent and prompt_item_present and item_followup_hint)
     if followup_item_response:
         baseline_intent = pending_item_intent
         context["intent"] = pending_item_intent
@@ -3634,22 +3741,39 @@ def interpret_prompt(
         baseline_intent = prior_session_intent
         context["intent"] = prior_session_intent
 
+    allow_item_inheritance = not (
+        context.get("intent") == "reorder"
+        and not prompt_item_present
+        and not followup_same_data
+        and not item_followup_hint
+    )
+
     if session_context:
-        context["item"] = context.get("item") or session_context.get("item")
+        if allow_item_inheritance:
+            context["item"] = context.get("item") or session_context.get("item")
+        elif not prompt_item_present:
+            context["item"] = None
         context["month"] = context.get("month") or session_context.get("month")
         context["year"] = context.get("year") or session_context.get("year")
         if isinstance(session_context.get("entities"), dict):
             context["entities"].update(session_context["entities"])
+            if not allow_item_inheritance:
+                context["entities"].pop("item", None)
+                context["entities"].pop("item_description", None)
 
     if memory_context:
         for entry in memory_context:
             metadata = entry.get("metadata") or {}
-            context["item"] = context.get("item") or metadata.get("item")
+            if allow_item_inheritance:
+                context["item"] = context.get("item") or metadata.get("item")
             context["month"] = context.get("month") or metadata.get("month")
             context["year"] = context.get("year") or metadata.get("year")
             entry_entities = metadata.get("entities")
             if isinstance(entry_entities, dict):
                 context["entities"].update(entry_entities)
+                if not allow_item_inheritance:
+                    context["entities"].pop("item", None)
+                    context["entities"].pop("item_description", None)
 
     memory_snippets = [entry.get("text") for entry in memory_context or []]
     llm_data = call_openai_interpreter(
@@ -3691,7 +3815,7 @@ def interpret_prompt(
                 context["intent"] = baseline_intent
         else:
             context["intent"] = baseline_intent
-    if llm_data.get("item"):
+    if llm_data.get("item") and (allow_item_inheritance or prompt_item_present):
         context["item"] = llm_data["item"]
     if llm_data.get("month"):
         context["month"] = llm_data["month"]
@@ -3703,6 +3827,9 @@ def interpret_prompt(
         context["notes"] = llm_data["notes"]
     if isinstance(llm_data.get("entities"), dict):
         context["entities"].update(llm_data["entities"])
+        if not allow_item_inheritance and not prompt_item_present:
+            context["entities"].pop("item", None)
+            context["entities"].pop("item_description", None)
     if llm_data.get("reply"):
         context["reply"] = llm_data["reply"]
     if context.get("reorder_hint") and context.get("intent") != "reorder":
@@ -3889,6 +4016,10 @@ def build_item_metric_report(
     combined_start: datetime.date | None = None
     combined_end: datetime.date | None = None
     total_value = 0.0
+    chart_payload: dict | None = None
+    chart_caption: str | None = None
+    chart_warning: str | None = None
+    graph_requested = bool(context.get("graph_requested"))
 
     for period in periods:
         start_date = period.get("start_date")
@@ -3978,12 +4109,48 @@ def build_item_metric_report(
     }
     if assumption_note:
         insights["assumption_note"] = assumption_note
+
+    if graph_requested:
+        chart_points: list[dict] = []
+        for sequence, detail in enumerate(period_details):
+            label = detail.get("label")
+            metric_value = detail.get(insight_key)
+            if not (label and isinstance(metric_value, Number)):
+                continue
+            chart_points.append(
+                {
+                    "Period": label,
+                    column_label: metric_value,
+                    "_sequence": sequence,
+                }
+            )
+        if len(chart_points) >= 2:
+            chart_payload = {
+                "type": "line",
+                "title": f"{item_code} {column_label} trend",
+                "data": chart_points,
+                "x_field": "Period",
+                "y_field": column_label,
+                "value_label": column_label,
+                "item": item_code,
+                "height": 280,
+            }
+            chart_caption = f"Line chart below: {item_code} {column_label.lower()} by period."
+        else:
+            chart_warning = "I need at least two periods to plot a graph. Try specifying multiple months or a range."
+
     result = {
         "data": rows,
         "sql": sql_preview,
         "context_type": context_type,
         "insights": insights,
     }
+    if chart_payload:
+        result["chart"] = chart_payload
+    if chart_caption:
+        result["chart_caption"] = chart_caption
+    if chart_warning:
+        result["chart_warning"] = chart_warning
     if suggestions:
         result["suggestions"] = suggestions
     return result
@@ -5562,6 +5729,21 @@ def compose_conversational_message(
     context_note = build_business_context_note(prompt, context, sql_payload)
     if context_note:
         reply_sections.append(context_note)
+    multi_warning = context.get("multi_intent_warning")
+    if isinstance(multi_warning, str):
+        warning_text = multi_warning.strip()
+        if warning_text:
+            reply_sections.append(warning_text)
+    chart_caption = sql_payload.get("chart_caption")
+    if isinstance(chart_caption, str):
+        caption_text = chart_caption.strip()
+        if caption_text:
+            reply_sections.append(caption_text)
+    chart_warning = sql_payload.get("chart_warning")
+    if isinstance(chart_warning, str):
+        warning_text = chart_warning.strip()
+        if warning_text:
+            reply_sections.append(warning_text)
 
     message = "\n\n".join(part for part in reply_sections if part).strip()
     footer = CORRECTION_PROMPT_FOOTER if intent != "chitchat" else ""
@@ -5637,6 +5819,7 @@ def handle_chat_prompt(
         "message": message,
         "data": sql_payload.get("data") if sql_payload else None,
         "sql": sql_payload.get("sql") if sql_payload else None,
+        "chart": sql_payload.get("chart") if sql_payload else None,
         "context_type": (
             sql_payload.get("context_type")
             if sql_payload and sql_payload.get("context_type")
@@ -5691,6 +5874,7 @@ def execute_chat_turn(
             "content": message,
             "sql": result.get("sql"),
             "data": result.get("data"),
+            "chart": result.get("chart"),
             "context": result.get("context"),
             "context_type": result.get("context_type"),
         }
@@ -5781,6 +5965,30 @@ def render_sql_chat(today: datetime.date, current_user: dict | None = None) -> N
                 st.code(entry["sql"], language="sql")
             if entry.get("data"):
                 st.dataframe(entry["data"], width="stretch")
+            chart_payload = entry.get("chart")
+            if isinstance(chart_payload, dict):
+                chart_data = chart_payload.get("data")
+                x_field = chart_payload.get("x_field") or "Period"
+                y_field = chart_payload.get("y_field")
+                if isinstance(chart_data, list) and chart_data and y_field:
+                    chart_df = None
+                    try:
+                        chart_df = pd.DataFrame(chart_data)
+                    except ValueError:
+                        chart_df = None
+                    if chart_df is not None and x_field in chart_df.columns and y_field in chart_df.columns:
+                        if "_sequence" in chart_df.columns:
+                            chart_df = chart_df.sort_values("_sequence")
+                        chart_df = chart_df[[x_field, y_field]].copy()
+                        value_label = chart_payload.get("value_label") or y_field
+                        chart_df = chart_df.rename(columns={y_field: value_label}).set_index(x_field)
+                        title = chart_payload.get("title")
+                        if isinstance(title, str) and title.strip():
+                            st.caption(title.strip())
+                        try:
+                            st.line_chart(chart_df, height=chart_payload.get("height") or 260)
+                        except StreamlitAPIException:
+                            st.dataframe(chart_df, width="stretch")
             if entry["role"] == "assistant":
                 cols = st.columns([0.6, 0.6, 4])
                 with cols[0]:
@@ -5961,6 +6169,7 @@ def render_sql_chat(today: datetime.date, current_user: dict | None = None) -> N
             "content": response.get("content", "Done."),
             "sql": response.get("sql"),
             "data": response.get("data"),
+            "chart": response.get("chart"),
             "context_type": context_type,
             "context": response.get("context"),
             "source_prompt": prompt_for_execution,
@@ -5975,6 +6184,7 @@ def render_sql_chat(today: datetime.date, current_user: dict | None = None) -> N
             "content": response.get("content"),
             "context_type": context_type,
             "sql": response.get("sql"),
+            "chart": response.get("chart"),
             "context": response.get("context"),
         }
     )
