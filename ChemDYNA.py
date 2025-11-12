@@ -13,7 +13,7 @@ import uuid
 from collections.abc import Iterable, Mapping
 from numbers import Number
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, Callable, TypedDict
 
 import pyodbc
 import requests
@@ -145,6 +145,87 @@ ITEM_FOLLOWING_KEYWORDS = {
     "SHORTFALL",
     "SUMMARY",
 }
+
+REORDER_ACTION_KEYWORDS: tuple[str, ...] = (
+    "need to order",
+    "need order",
+    "need another order",
+    "do we order",
+    "do i order",
+    "do we need to order",
+    "do i need to order",
+    "have to order",
+    "should we order",
+    "should i order",
+    "order more",
+    "order another",
+    "order again",
+    "buy more",
+    "buy again",
+    "need to buy",
+    "need buy",
+    "should we buy",
+    "should i buy",
+    "purchase more",
+    "need to purchase",
+    "restock",
+    "restocking",
+    "re-stock",
+    "re order",
+    "reorder",
+    "reordering",
+    "reorder list",
+    "reorder report",
+    "replenish",
+    "replenishment",
+    "stock up",
+    "stockup",
+    "what should we buy",
+    "what should i buy",
+    "what to buy",
+    "what to reorder",
+    "what should we reorder",
+    "what should i reorder",
+)
+
+REORDER_SHORTAGE_KEYWORDS: tuple[str, ...] = (
+    "running low",
+    "inventory low",
+    "low inventory",
+    "low on",
+    "low stock",
+    "stock is low",
+    "stock low",
+    "stock getting low",
+    "getting low on",
+    "almost out",
+    "nearly out",
+    "out of stock",
+    "stock out",
+    "stockout",
+    "shortfall",
+    "shortfalls",
+    "short on",
+    "shortage",
+    "shortages",
+    "order point",
+    "order-point",
+    "reorder point",
+    "re-order point",
+    "below order point",
+    "under order point",
+    "below min",
+    "below minimum",
+    "min qty",
+    "minimum qty",
+    "safety stock",
+    "backorder",
+    "back order",
+    "back-ordered",
+    "need more on hand",
+    "need more inventory",
+)
+
 RESET_COMMANDS = {"reset", "clear", "clear chat", "restart"}
 CORRECTION_PREFIXES = ("correction:", "fix:")
 CORRECTION_PROMPT_FOOTER = "If this isn’t what you meant, tell me what to fix (e.g., 'use December too' or 'wrong intent')."
@@ -176,6 +257,30 @@ USER_SCOPED_STATE_BASE_KEYS = [
     CHAT_ACTIVE_SESSION_KEY,
     SEMANTIC_MEMORY_KEY,
 ]
+CUSTOM_SQL_INTENT = "custom_sql"
+MULTI_ITEM_INTENT = "multi_report"
+ALL_ITEMS_INTENT = "all_items"
+CUSTOM_SQL_MAX_ROWS = 200
+CUSTOM_SQL_ALLOWED_TABLES: tuple[str, ...] = (
+    "IV00101",
+    "IV00102",
+    "IV30200",
+    "IV30300",
+    "POP10100",
+    "POP10110",
+    "POP30100",
+    "POP30110",
+    "POP30200",
+    "POP30300",
+    "POP30310",
+    "SOP10100",
+    "SOP10200",
+    "SOP30200",
+    "SOP30300",
+)
+SQL_SCHEMA_CACHE_KEY = "default"
+SQL_SCHEMA_CACHE: dict[str, dict[str, list[dict]]] = {}
+SQL_TABLE_TOKEN_PATTERN = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z0-9_\.\[\]]+)", re.IGNORECASE)
 
 def _sanitize_user_fragment(value: str | None) -> str:
     if not value:
@@ -688,7 +793,11 @@ def load_openai_settings() -> dict:
         return {}
 
     model = openai_section.get("model", OPENAI_DEFAULT_MODEL)
-    return {"api_key": api_key, "model": model}
+    sql_model = openai_section.get("sql_model") or openai_section.get("query_model")
+    settings = {"api_key": api_key, "model": model}
+    if sql_model:
+        settings["sql_model"] = sql_model
+    return settings
 
 
 def build_connection_string() -> tuple[str, str, str, str]:
@@ -1109,14 +1218,14 @@ def logout_current_user() -> None:
     st.rerun()
 
 
-def extract_item_code(prompt: str) -> str | None:
+def extract_item_candidates(prompt: str, limit: int = 5) -> list[str]:
     """
-    Return the first uppercase token that looks like an item number.
+    Return up to limit candidate item tokens using the same priority as extract_item_code.
     """
 
     raw_tokens = ITEM_TOKEN_PATTERN.findall(prompt.upper())
     if not raw_tokens:
-        return None
+        return []
 
     keyword_candidates: list[str] = []
     digit_candidates: list[str] = []
@@ -1147,13 +1256,24 @@ def extract_item_code(prompt: str) -> str | None:
         if idx == 0:
             leading_candidates.append(token)
 
-    if digit_candidates:
-        return digit_candidates[0]
-    if keyword_candidates:
-        return keyword_candidates[0]
-    if leading_candidates:
-        return leading_candidates[0]
-    return None
+    ordered = digit_candidates + keyword_candidates + leading_candidates
+    candidates: list[str] = []
+    for token in ordered:
+        if token in candidates:
+            continue
+        candidates.append(token)
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def extract_item_code(prompt: str) -> str | None:
+    """
+    Return the first uppercase token that looks like an item number.
+    """
+
+    candidates = extract_item_candidates(prompt, limit=1)
+    return candidates[0] if candidates else None
 
 
 def extract_description_keywords(text: str, max_terms: int = 3) -> list[str]:
@@ -1190,6 +1310,107 @@ def extract_multiplier(prompt: str) -> float | None:
     return None
 
 
+CLASS_FILTER_REGEX = re.compile(
+    r"\bclass(?:\s+code|\s+is|[:=])?\s*(['\"])?([A-Za-z0-9][A-Za-z0-9._-]{1,})\1?",
+    flags=re.IGNORECASE,
+)
+BELOW_ORDER_POINT_REGEX = re.compile(
+    r"(below|under|less than)\s+(?:their\s+|the\s+)?(?:re)?order\s*-?\s*points?",
+    flags=re.IGNORECASE,
+)
+BELOW_ORDER_POINT_EXTRA_PHRASES = (
+    "below reorder point",
+    "below their reorder",
+    "below reorder",
+    "under reorder point",
+    "under their reorder point",
+    "under order point",
+    "under the order point",
+    "below order point",
+    "below orderpoint",
+    "under orderpoint",
+)
+
+
+def _clean_class_token(token: str | None) -> str | None:
+    if not token:
+        return None
+    cleaned = token.strip().strip("\"'.,)")
+    if len(cleaned) < 2:
+        return None
+    return cleaned.upper()
+
+
+def extract_item_class_from_text(text: str | None) -> str | None:
+    if not text:
+        return None
+    match = CLASS_FILTER_REGEX.search(text)
+    if match:
+        candidate = match.group(2) or match.group(1)
+        cleaned = _clean_class_token(candidate)
+        if cleaned:
+            return cleaned
+    return None
+
+
+def references_below_order_point(text: str | None) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(phrase in lowered for phrase in BELOW_ORDER_POINT_EXTRA_PHRASES):
+        return True
+    if BELOW_ORDER_POINT_REGEX.search(text):
+        return True
+    return False
+
+
+def extract_inventory_filters(prompt: str, context: dict | None = None) -> dict:
+    """
+    Determine optional filters (class, below order point) inferred from the prompt/context.
+    """
+
+    context = context or {}
+    entities = context.get("entities")
+    if not isinstance(entities, dict):
+        entities = {}
+    entity_filters = entities.get("filters")
+    if not isinstance(entity_filters, dict):
+        entity_filters = {}
+
+    class_candidate = None
+    for source in (entity_filters, entities):
+        for key in CLASS_ENTITY_KEYS:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                class_candidate = value.strip().upper()
+                break
+        if class_candidate:
+            break
+
+    text_sources: list[str] = []
+    for candidate in (prompt, context.get("notes"), context.get("reply")):
+        if isinstance(candidate, str) and candidate.strip():
+            text_sources.append(candidate)
+    for chunk in text_sources:
+        if not class_candidate:
+            class_candidate = extract_item_class_from_text(chunk)
+        if class_candidate:
+            break
+
+    below_order_point = any(references_below_order_point(chunk) for chunk in text_sources)
+    if not below_order_point:
+        for key in ("below_order_point", "below_reorder_point", "below_reorder"):
+            if entity_filters.get(key):
+                below_order_point = True
+                break
+        if not below_order_point:
+            order_point_state = entity_filters.get("order_point")
+            if isinstance(order_point_state, str) and order_point_state.lower() in {"below", "under", "less"}:
+                below_order_point = True
+
+    return {"item_class": class_candidate, "below_order_point": below_order_point}
+
+
 def resolve_item_from_context(prompt: str, context: dict | None) -> str | None:
     """
     Prefer explicit context/entity values, then fall back to token extraction.
@@ -1202,6 +1423,298 @@ def resolve_item_from_context(prompt: str, context: dict | None) -> str | None:
     return candidate or extract_item_code(prompt)
 
 
+def resolve_item_with_fallbacks(
+    cursor: pyodbc.Cursor,
+    prompt: str,
+    context: dict | None,
+    *,
+    auto_select_single: bool = True,
+) -> tuple[str | None, list[dict], str | None]:
+    """
+    Return (item_code, suggestions, assumption_note). When no explicit item is present but a single
+    description match exists, optionally auto-select it so downstream SQL can proceed.
+    """
+
+    context = context or {}
+    item_code = resolve_item_from_context(prompt, context)
+    if item_code:
+        return item_code, [], None
+
+    suggestions = suggest_items_by_description(cursor, prompt)
+    assumption_note = None
+    if auto_select_single and len(suggestions) == 1:
+        assumed = suggestions[0].get("Item")
+        if assumed:
+            item_code = assumed
+            description = suggestions[0].get("Description")
+            if description:
+                assumption_note = f"Assuming you meant {assumed} ({description}) based on your description."
+            else:
+                assumption_note = f"Assuming you meant {assumed} based on your description."
+            context["item"] = assumed
+            existing_notes = context.get("notes")
+            context["notes"] = (
+                f"{existing_notes} {assumption_note}".strip() if existing_notes else assumption_note
+            )
+    return item_code, suggestions, assumption_note
+
+
+SITE_ENTITY_KEYS = (
+    "site",
+    "sites",
+    "location",
+    "locations",
+    "warehouse",
+    "warehouses",
+    "plant",
+    "plants",
+    "facility",
+    "facilities",
+    "loc",
+    "locs",
+)
+SITE_VALUE_KEYS = ("code", "value", "name", "label", "site", "location", "warehouse", "plant", "facility", "id")
+SITE_ALL_TOKENS = {
+    "ALL",
+    "ANY",
+    "ALL LOCATIONS",
+    "ALL SITES",
+    "ALL WAREHOUSES",
+    "COMPANY",
+    "COMPANY WIDE",
+    "COMPANYWIDE",
+}
+ITEM_LIST_ENTITY_KEYS = (
+    "items",
+    "item_list",
+    "item_numbers",
+    "skus",
+    "sku_list",
+    "materials",
+    "products",
+)
+ITEM_VALUE_KEYS = ("item", "items", "code", "value", "number", "sku", "material", "product", "label", "id")
+KEYWORD_VALUE_KEYS = ("keywords", "keyword", "value", "label", "description", "text")
+CLASS_ENTITY_KEYS = (
+    "item_class",
+    "item_classes",
+    "class_code",
+    "class_codes",
+    "class",
+    "classes",
+    "itmclscd",
+    "category",
+    "categories",
+    "group",
+    "groups",
+)
+CLASS_VALUE_KEYS = ("code", "value", "name", "label", "class", "item_class", "itmclscd", "category", "group")
+CLASS_ALL_TOKENS = {
+    "ALL",
+    "ANY",
+    "ALL CLASSES",
+    "ALL ITEMS",
+    "ALL PRODUCTS",
+}
+
+
+def _collect_contextual_filters(context: dict | None, candidate_keys: tuple[str, ...]) -> list:
+    context = context or {}
+    collected: list = []
+    for key in candidate_keys:
+        value = context.get(key)
+        if value is not None:
+            collected.append(value)
+    entities = context.get("entities")
+    if isinstance(entities, Mapping):
+        for key in candidate_keys:
+            value = entities.get(key)
+            if value is not None:
+                collected.append(value)
+        filters_section = entities.get("filters")
+        if isinstance(filters_section, Mapping):
+            for key in candidate_keys:
+                value = filters_section.get(key)
+                if value is not None:
+                    collected.append(value)
+    return collected
+
+
+def _flatten_filter_values(value, allowed_nested_keys: tuple[str, ...]) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return [cleaned] if cleaned else []
+    if isinstance(value, (list, tuple, set)):
+        flattened: list[str] = []
+        for entry in value:
+            flattened.extend(_flatten_filter_values(entry, allowed_nested_keys))
+        return flattened
+    if isinstance(value, Mapping):
+        flattened: list[str] = []
+        matched_key = False
+        for key in allowed_nested_keys:
+            if key in value:
+                flattened.extend(_flatten_filter_values(value[key], allowed_nested_keys))
+                matched_key = True
+        if not matched_key:
+            for entry in value.values():
+                flattened.extend(_flatten_filter_values(entry, allowed_nested_keys))
+        return flattened
+    return []
+
+
+def _normalize_filter_tokens(values: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = value.strip()
+        if not cleaned:
+            continue
+        token = cleaned.upper()
+        if token not in seen:
+            normalized.append(token)
+            seen.add(token)
+    return normalized
+
+
+def _matches_all_token(token: str, token_set: set[str]) -> bool:
+    simplified = re.sub(r"[\s_-]+", " ", token).strip()
+    return simplified in token_set
+
+
+def _wildcard_value(value: str) -> str:
+    return value if any(char in value for char in ("%","_")) else f"%{value}%"
+
+
+def resolve_site_filters(context: dict | None) -> tuple[list[str], bool, bool]:
+    raw_values = _collect_contextual_filters(context, SITE_ENTITY_KEYS)
+    flattened: list[str] = []
+    for entry in raw_values:
+        flattened.extend(_flatten_filter_values(entry, SITE_VALUE_KEYS))
+    normalized = _normalize_filter_tokens(flattened)
+    if not normalized:
+        return ["MAIN"], False, False
+    if any(_matches_all_token(token, SITE_ALL_TOKENS) for token in normalized):
+        return [], True, True
+    return normalized, True, False
+
+
+def resolve_class_filters(context: dict | None) -> tuple[list[str], bool, bool]:
+    raw_values = _collect_contextual_filters(context, CLASS_ENTITY_KEYS)
+    flattened: list[str] = []
+    for entry in raw_values:
+        flattened.extend(_flatten_filter_values(entry, CLASS_VALUE_KEYS))
+    normalized = _normalize_filter_tokens(flattened)
+    if not normalized:
+        return [], False, False
+    if any(_matches_all_token(token, CLASS_ALL_TOKENS) for token in normalized):
+        return [], True, True
+    return normalized, True, False
+
+
+def resolve_item_list_filters(context: dict | None) -> list[str]:
+    raw_values = _collect_contextual_filters(context, ITEM_LIST_ENTITY_KEYS)
+    flattened: list[str] = []
+    for entry in raw_values:
+        flattened.extend(_flatten_filter_values(entry, ITEM_VALUE_KEYS))
+    normalized = _normalize_filter_tokens(flattened)
+    return normalized
+
+
+def gather_scope_keywords(prompt: str, context: dict | None, max_terms: int = 3) -> list[str]:
+    keywords = extract_description_keywords(prompt, max_terms)
+    entities = (context or {}).get("entities")
+    if isinstance(entities, Mapping):
+        for key in ("keywords", "keyword", "item_description", "description"):
+            keywords.extend(_flatten_filter_values(entities.get(key), KEYWORD_VALUE_KEYS))
+        filters = entities.get("filters")
+        if isinstance(filters, Mapping):
+            for key in ("keywords", "keyword", "description"):
+                keywords.extend(_flatten_filter_values(filters.get(key), KEYWORD_VALUE_KEYS))
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for token in keywords:
+        if not token:
+            continue
+        cleaned = str(token).strip().upper()
+        if len(cleaned) < 3:
+            continue
+        if cleaned in seen:
+            continue
+        normalized.append(cleaned)
+        seen.add(cleaned)
+        if len(normalized) >= max_terms:
+            break
+    return normalized
+
+
+def human_join(values: list[str]) -> str:
+    cleaned = [value.strip() for value in values if isinstance(value, str) and value.strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
+
+
+def describe_site_scope(site_codes: list[str], covers_all: bool) -> str:
+    if covers_all:
+        return "all locations"
+    if not site_codes:
+        return ""
+    return site_codes[0] if len(site_codes) == 1 else human_join(site_codes)
+
+
+def site_error_clause(site_codes: list[str], covers_all: bool) -> str:
+    label = describe_site_scope(site_codes, covers_all)
+    if not label:
+        return ""
+    if covers_all:
+        return f"across {label}"
+    if len(site_codes) == 1:
+        return f"at {label}"
+    return f"across {label}"
+
+
+def describe_class_scope(class_filters: list[str], covers_all: bool) -> str:
+    if covers_all:
+        return "all classes"
+    if not class_filters:
+        return ""
+    return human_join(class_filters)
+
+
+def build_scope_note(
+    site_codes: list[str],
+    site_explicit: bool,
+    site_covers_all: bool,
+    class_filters: list[str],
+    class_explicit: bool,
+    class_covers_all: bool,
+) -> str:
+    parts: list[str] = []
+    site_label = describe_site_scope(site_codes, site_covers_all)
+    if site_covers_all:
+        parts.append("Scope spans all locations.")
+    elif site_label:
+        if site_explicit:
+            parts.append(f"Scope limited to {site_label}.")
+        else:
+            parts.append(f"No site mentioned, so I defaulted to {site_label}.")
+    if class_explicit:
+        class_label = describe_class_scope(class_filters, class_covers_all)
+        if class_label:
+            if class_covers_all:
+                parts.append("Included all classes per your request.")
+            else:
+                parts.append(f"Class filter: {class_label}.")
+    return " ".join(parts).strip()
+
+
 def update_session_context(session_context: dict, context: dict | None) -> None:
     """
     Persist the latest interpreted context so follow-up questions inherit it.
@@ -1209,9 +1722,15 @@ def update_session_context(session_context: dict, context: dict | None) -> None:
 
     if not isinstance(session_context, dict) or not isinstance(context, dict):
         return
-    for key in ("intent", "item", "month", "year", "multiplier"):
-        if context.get(key) is not None:
-            session_context[key] = context[key]
+    tracked_keys = ("intent", "item", "month", "year", "multiplier", "needs_item_for_intent")
+    for key in tracked_keys:
+        if key not in context:
+            continue
+        value = context.get(key)
+        if value is None:
+            session_context.pop(key, None)
+        else:
+            session_context[key] = value
     entities = context.get("entities")
     if isinstance(entities, dict) and entities:
         session_context.setdefault("entities", {})
@@ -1260,6 +1779,7 @@ NUMBER_WORDS = {
     "eleven": 11,
     "twelve": 12,
 }
+ZERO_USAGE_EPSILON = 1e-4
 
 MAX_USAGE_PERIODS = 6
 DEFAULT_USAGE_HISTORY_MONTHS = 3
@@ -1500,6 +2020,35 @@ def determine_usage_periods(prompt: str, context: dict | None, today: datetime.d
     return [build_month_usage_period(month_int, year_int)]
 
 
+def determine_scope_period(
+    prompt: str,
+    context: dict | None,
+    today: datetime.date,
+) -> tuple[datetime.date, datetime.date, str, list[UsagePeriod]]:
+    periods = determine_usage_periods(prompt, context, today) or []
+    if not periods:
+        month_guess, year_guess = infer_period_from_text(prompt, today)
+        periods = [build_month_usage_period(month_guess, year_guess)]
+    valid_periods = [
+        period
+        for period in periods
+        if isinstance(period.get("start_date"), datetime.date) and isinstance(period.get("end_date"), datetime.date)
+    ]
+    if not valid_periods:
+        month_guess, year_guess = infer_period_from_text(prompt, today)
+        fallback = build_month_usage_period(month_guess, year_guess)
+        valid_periods = [fallback]
+    start_date = min(period["start_date"] for period in valid_periods if isinstance(period["start_date"], datetime.date))
+    end_date = max(period["end_date"] for period in valid_periods if isinstance(period["end_date"], datetime.date))
+    if len(valid_periods) == 1:
+        period_label = valid_periods[0].get("label") or start_date.strftime("%B %Y")
+    else:
+        first_label = valid_periods[0].get("label") or valid_periods[0]["start_date"].strftime("%B %Y")
+        last_label = valid_periods[-1].get("label") or valid_periods[-1]["end_date"].strftime("%B %Y")
+        period_label = f"{first_label} - {last_label}"
+    return start_date, end_date, period_label, valid_periods
+
+
 def suggest_items_by_description(
     cursor: pyodbc.Cursor,
     description_text: str,
@@ -1550,35 +2099,62 @@ def format_item_suggestions(suggestions: list[dict]) -> str:
     return "Did you mean: " + ", ".join(formatted) + "?"
 
 
+def looks_like_reorder_prompt(prompt: str, lowered: str | None = None) -> bool:
+    haystack = lowered if lowered is not None else prompt.lower()
+    if any(keyword in haystack for keyword in REORDER_ACTION_KEYWORDS):
+        return True
+    if any(keyword in haystack for keyword in REORDER_SHORTAGE_KEYWORDS):
+        return True
+    return False
+
+
 def classify_chat_intent(prompt: str) -> str:
     lowered = prompt.lower()
-    compare_keywords = ("compare", "versus", "vs ", "vs.", "difference between", "diff between")
-    if any(keyword in lowered for keyword in compare_keywords):
+    if contains_compare_language(prompt):
+        if looks_like_inventory_vs_usage_prompt(prompt):
+            return "inventory_usage"
         return "compare"
 
     drop_keywords = ("drop", "decline", "decrease", "fall", "slump", "down", "lower")
     if ("why" in lowered or "reason" in lowered) and any(keyword in lowered for keyword in drop_keywords):
         return "why_drop"
 
-    reorder_keywords = (
-        "buy",
-        "purchase",
-        "restock",
-        "reorder",
-        "need to order",
-        "need to buy",
-        "order more",
-        "running low",
-        "inventory low",
+    custom_sql_keywords = (
+        "purchase order",
+        "purchase orders",
+        "purchase history",
+        "purchase quantity",
+        "purchased",
+        "vendor spend",
+        "vendor invoice",
+        "vendor history",
+        "receipts",
+        "receipt history",
+        "po#",
+        "p.o.",
     )
-    if any(keyword in lowered for keyword in reorder_keywords):
+    if any(keyword in lowered for keyword in custom_sql_keywords):
+        return CUSTOM_SQL_INTENT
+
+    if looks_like_reorder_prompt(prompt, lowered):
         return "reorder"
     explanation_keywords = ("mean", "explain", "why", "how", "what does", "difference", "clarify", "tell me more")
     if any(keyword in lowered for keyword in explanation_keywords):
         return "chitchat"
-    if any(keyword in lowered for keyword in ("sale", "sales", "usage", "adjust", "consumption", "report", "summary")):
+
+    has_item_code = bool(extract_item_code(prompt))
+    data_request = contains_data_request_keywords(prompt)
+    if data_request and looks_like_all_items_prompt(prompt) and not has_item_code:
+        return ALL_ITEMS_INTENT
+    if data_request and looks_like_multi_item_prompt(prompt):
+        return MULTI_ITEM_INTENT
+
+    if contains_sales_intent(prompt):
+        return "sales"
+
+    if contains_usage_intent(prompt):
         return "report"
-    if any(keyword in lowered for keyword in ("inventory", "on hand", "stock", "available", "order point")):
+    if contains_inventory_intent(prompt):
         return "inventory"
     match = ITEM_TOKEN_PATTERN.search(prompt.upper())
     if match:
@@ -1606,11 +2182,201 @@ DATA_REQUEST_KEYWORDS: tuple[str, ...] = (
     "numbers",
     "figures",
     "sales",
+    "invoice",
+    "invoices",
+    "sold",
+    "selling",
+    "ship",
+    "shipped",
+    "shipment",
+    "shipments",
+    "customer order",
+    "customer orders",
+    "revenue",
     "use",
     "using",
     "demand",
     "forecast",
     "how much",
+)
+
+USAGE_HISTORY_KEYWORDS: tuple[str, ...] = (
+    "usage",
+    "usage report",
+    "usage history",
+    "usage summary",
+    "usage trend",
+    "historical usage",
+    "past usage",
+    "no usage",
+    "zero usage",
+    "not used",
+    "haven't used",
+    "consumption",
+    "consumed",
+    "consumption history",
+    "consumption report",
+    "demand history",
+    "sales",
+    "sales report",
+    "sales history",
+    "invoice history",
+    "invoiced sales",
+    "shipped",
+    "shipments",
+)
+
+INVENTORY_INTENT_KEYWORDS: tuple[str, ...] = (
+    "inventory",
+    "on hand",
+    "stock",
+    "available",
+    "available stock",
+    "availability",
+    "avail",
+    "qty available",
+    "order point",
+    "reorder point",
+    "below reorder point",
+    "under reorder point",
+    "safety stock",
+    "qty on hand",
+    "qoh",
+)
+
+USAGE_INTENT_KEYWORDS: tuple[str, ...] = (
+    "usage",
+    "adjust",
+    "consumption",
+    "report",
+    "summary",
+    "use",
+    "using",
+)
+
+USAGE_METRIC_KEYWORDS: tuple[str, ...] = (
+    "usage",
+    "use",
+    "using",
+    "consume",
+    "consumed",
+    "consumption",
+)
+
+SALES_INTENT_KEYWORDS: tuple[str, ...] = (
+    "sale",
+    "sales",
+    "sold",
+    "selling",
+    "invoice",
+    "invoices",
+    "invoiced",
+    "ship",
+    "shipped",
+    "shipment",
+    "shipments",
+    "customer order",
+    "customer orders",
+    "customer shipment",
+    "customer shipments",
+)
+
+MULTI_ITEM_SCOPE_KEYWORDS: tuple[str, ...] = (
+    "which items",
+    "any items",
+    "items with",
+    "items that",
+    "items showing",
+    "item class",
+    "item classes",
+    "classes of items",
+    "per class",
+    "by class",
+    "item groups",
+    "product group",
+    "product family",
+    "material group",
+    "skus with",
+    "sku group",
+)
+
+ALL_ITEMS_SCOPE_KEYWORDS: tuple[str, ...] = (
+    "all items",
+    "every item",
+    "overall items",
+    "overall inventory",
+    "entire catalog",
+    "entire list",
+    "whole catalog",
+    "whole list",
+    "across the board",
+    "across all items",
+)
+
+ZERO_USAGE_PHRASES: tuple[str, ...] = (
+    "no usage",
+    "zero usage",
+    "not used",
+    "did not move",
+    "no one used",
+    "nobody used",
+    "unused",
+    "no consumption",
+    "zero consumption",
+)
+
+PLURAL_ITEM_TOKENS: tuple[str, ...] = (
+    "items",
+    "skus",
+    "products",
+    "materials",
+    "chemicals",
+    "ingredients",
+    "components",
+)
+
+TOTAL_SCOPE_KEYWORDS: tuple[str, ...] = (
+    "total",
+    "overall",
+    "grand total",
+    "combined",
+    "all in",
+    "all-in",
+    "entire period",
+    "whole period",
+    "cumulative",
+)
+
+AVAILABLE_FIELD_KEYWORDS: tuple[str, ...] = (
+    "available",
+    "availability",
+    "available stock",
+    "avail",
+    "available to promise",
+    "atp",
+)
+
+ON_HAND_FIELD_KEYWORDS: tuple[str, ...] = (
+    "on hand",
+    "on-hand",
+    "onhand",
+    "physical stock",
+    "physically on hand",
+    "stock on hand",
+)
+
+COMPARE_KEYWORDS: tuple[str, ...] = (
+    "compare",
+    "compared to",
+    "compared with",
+    "comparing",
+    "versus",
+    "vs ",
+    "vs.",
+    "difference between",
+    "diff between",
+    "relative to",
+    "against",
 )
 
 SMALL_TALK_PHRASES: tuple[str, ...] = (
@@ -1645,16 +2411,218 @@ CAPABILITY_QUESTION_PHRASES: tuple[str, ...] = (
     "what should i ask",
 )
 
+CONCEPTUAL_QUESTION_KEYWORDS: tuple[str, ...] = (
+    "what is",
+    "what's",
+    "what does",
+    "mean",
+    "meaning of",
+    "definition of",
+    "define",
+    "explain",
+    "explanation of",
+    "tell me about",
+    "talk me through",
+    "how does",
+    "why do we",
+    "what do you mean by",
+)
+
+GP_CONCEPT_KNOWLEDGE: dict[str, dict[str, Any]] = {
+    "reorder point": {
+        "aliases": ("reorder point", "order point"),
+        "definition": (
+            "The stocking target for an item. It covers expected demand during supplier lead time "
+            "plus whatever safety stock buffer you set."
+        ),
+        "context": "When Available quantity drops below the reorder point, the GP reorder report flags the shortfall.",
+    },
+    "reorder gap": {
+        "aliases": ("reorder gap", "gap", "shortfall"),
+        "definition": "The difference between the reorder point and the available quantity (Order Point - Available).",
+        "context": "A positive gap is how many units you still need to buy to get back to the target level.",
+    },
+    "lead time": {
+        "aliases": ("lead time", "lead-time", "leadtime"),
+        "definition": "The number of calendar days between placing a purchase order and receiving usable stock.",
+        "context": "Lead time feeds the reorder point calculation because longer lead times require covering more usage.",
+    },
+    "safety stock": {
+        "aliases": ("safety stock", "safety inventory", "buffer stock"),
+        "definition": "The extra quantity you keep on top of lead-time demand to absorb forecast or supply variability.",
+        "context": "In GP it's often modeled as additional days of usage so the reorder point isn't exhausted by normal swings.",
+    },
+    "available quantity": {
+        "aliases": ("available quantity", "qty available", "available qty", "avail"),
+        "definition": "GP's Available field equals On Hand + On Order - Allocations.",
+        "context": "It's the snapshot of what you can ship right now, and it's compared to the reorder point to find gaps.",
+    },
+}
+
 SAMPLE_ITEM_SUGGESTIONS: tuple[str, ...] = (
     "NO3MN",
     "NO3CA12",
     "AO4ADD",
 )
+ITEM_FOLLOWUP_IGNORE_KEYWORDS: tuple[str, ...] = (
+    "usage",
+    "report",
+    "summary",
+    "compare",
+    "comparison",
+    "inventory",
+    "reorder",
+    "why",
+    "drop",
+    "decline",
+    "order",
+    "buy",
+    "sales",
+    "trend",
+    "history",
+    "table",
+    "data",
+    "show",
+    "display",
+)
+ITEM_FOLLOWUP_WORDS: set[str] = {
+    "use",
+    "using",
+    "its",
+    "it's",
+    "item",
+    "sku",
+    "code",
+    "number",
+    "same",
+    "this",
+    "that",
+}
+ITEM_FOLLOWUP_PHRASES: tuple[str, ...] = (
+    "that one",
+    "this one",
+    "same item",
+    "same one",
+    "go with",
+)
+PENDING_ITEM_RESET_KEYWORDS: tuple[str, ...] = (
+    "usage",
+    "report",
+    "summary",
+    "compare",
+    "comparison",
+    "inventory",
+    "reorder",
+    "why",
+    "drop",
+    "decline",
+    "order",
+    "buy",
+    "restock",
+    "stock",
+    "sales",
+    "trend",
+    "history",
+    "table",
+    "data",
+)
+
+
+def contains_reorder_intent(prompt: str) -> bool:
+    return looks_like_reorder_prompt(prompt)
+
+
+def contains_inventory_intent(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return any(keyword in lowered for keyword in INVENTORY_INTENT_KEYWORDS)
+
+
+def contains_sales_intent(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return any(keyword in lowered for keyword in SALES_INTENT_KEYWORDS)
+
+
+def contains_usage_intent(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return any(keyword in lowered for keyword in USAGE_INTENT_KEYWORDS)
+
+
+def contains_compare_language(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return any(keyword in lowered for keyword in COMPARE_KEYWORDS)
+
+
+def looks_like_inventory_vs_usage_prompt(prompt: str) -> bool:
+    """
+    Identify prompts that explicitly compare availability/stock metrics to usage.
+    """
+
+    return (
+        contains_compare_language(prompt)
+        and contains_inventory_intent(prompt)
+        and contains_usage_intent(prompt)
+    )
+
+
+def mentions_usage_history(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return any(keyword in lowered for keyword in USAGE_HISTORY_KEYWORDS)
 
 
 def contains_data_request_keywords(prompt: str) -> bool:
     lowered = prompt.lower()
     return any(keyword in lowered for keyword in DATA_REQUEST_KEYWORDS)
+
+
+def mentions_plural_item_language(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return any(re.search(rf"\b{re.escape(token)}\b", lowered) for token in PLURAL_ITEM_TOKENS)
+
+
+def looks_like_all_items_prompt(prompt: str) -> bool:
+    lowered = prompt.lower()
+    if any(phrase in lowered for phrase in ALL_ITEMS_SCOPE_KEYWORDS):
+        return True
+    if mentions_plural_item_language(prompt) and any(phrase in lowered for phrase in ZERO_USAGE_PHRASES):
+        return True
+    return False
+
+
+def looks_like_multi_item_prompt(prompt: str) -> bool:
+    lowered = prompt.lower()
+    if any(phrase in lowered for phrase in MULTI_ITEM_SCOPE_KEYWORDS):
+        return True
+    if mentions_plural_item_language(prompt) and any(
+        trigger in lowered for trigger in ("which", "any", "list", "show", "had", "have")
+    ):
+        return True
+    if len(extract_item_candidates(prompt, limit=3)) >= 2:
+        return True
+    return False
+
+
+def wants_zero_usage_only(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return any(phrase in lowered for phrase in ZERO_USAGE_PHRASES)
+
+
+def looks_like_item_followup(prompt: str) -> bool:
+    normalized = " ".join(prompt.lower().split())
+    if not normalized:
+        return False
+    tokens = ITEM_TOKEN_PATTERN.findall(prompt.upper())
+    valid_items = [token for token in tokens if token not in CHAT_ITEM_STOPWORDS]
+    if not valid_items:
+        return False
+    if any(keyword in normalized for keyword in ITEM_FOLLOWUP_IGNORE_KEYWORDS):
+        return False
+    stripped = normalized.replace("'", " ")
+    words = stripped.split()
+    if len(words) <= 6:
+        return True
+    if ITEM_FOLLOWUP_WORDS.intersection(words):
+        return True
+    return any(phrase in normalized for phrase in ITEM_FOLLOWUP_PHRASES)
 
 
 def looks_like_small_talk(prompt: str) -> bool:
@@ -1676,6 +2644,202 @@ def looks_like_small_talk(prompt: str) -> bool:
     return False
 
 
+def looks_like_conceptual_question(prompt: str) -> bool:
+    normalized = " ".join(prompt.lower().split())
+    if not normalized:
+        return False
+    if any(keyword in normalized for keyword in CONCEPTUAL_QUESTION_KEYWORDS):
+        return True
+    # Short direct questions like "Order point?" should also be treated as conceptual.
+    if normalized.endswith("?") and len(normalized.split()) <= 4:
+        return True
+    return False
+
+
+def lookup_gp_concept(prompt: str) -> dict[str, str] | None:
+    lowered = prompt.lower()
+    for key, details in GP_CONCEPT_KNOWLEDGE.items():
+        aliases = details.get("aliases") or (key,)
+        for alias in aliases:
+            if not alias:
+                continue
+            pattern = r"\b" + re.escape(alias.lower()) + r"\b"
+            if re.search(pattern, lowered):
+                definition = details.get("definition")
+                if not definition:
+                    continue
+                label = details.get("label") or key.title()
+                context = details.get("context")
+                return {
+                    "label": label,
+                    "definition": definition,
+                    "context": context or "",
+                }
+    return None
+
+
+def describe_gp_concept(prompt: str) -> str | None:
+    concept = lookup_gp_concept(prompt)
+    if not concept:
+        return None
+    parts = [f"{concept['label']}: {concept['definition']}"]
+    context = concept.get("context")
+    if context:
+        parts.append(context)
+    return " ".join(parts).strip()
+
+
+def detect_multi_intent_usage_conflict(prompt: str) -> str | None:
+    """
+    Return a warning message when a single prompt mixes usage/report logic with
+    reorder or inventory filters that require separate SQL templates.
+    """
+
+    if not prompt:
+        return None
+    wants_usage = mentions_usage_history(prompt)
+    if not wants_usage:
+        return None
+    reorder_needed = contains_reorder_intent(prompt)
+    inventory_needed = contains_inventory_intent(prompt)
+    if not (reorder_needed or inventory_needed):
+        return None
+
+    conflict_labels: list[str] = []
+    if reorder_needed:
+        conflict_labels.append("reorder")
+    if inventory_needed:
+        conflict_labels.append("inventory")
+    conflict_text = " and ".join(conflict_labels)
+    return (
+        f"That request mixes historical usage/sales with {conflict_text} criteria. "
+        "I can only run one template at a time, so please split it into separate questions "
+        "(for example, pull the usage or sales report first, then run an inventory or reorder check)."
+    )
+
+
+INVENTORY_ZERO_KEY_PHRASES: tuple[str, ...] = (
+    "zero on hand",
+    "0 on hand",
+    "no on hand",
+    "zero qty on hand",
+    "zero quantity on hand",
+    "no inventory on hand",
+    "no stock on hand",
+    "zero inventory",
+    "zero stock",
+    "out of stock",
+    "stocked out",
+    "stock out",
+    "stockout",
+    "without stock",
+    "nothing on hand",
+)
+
+INVENTORY_FILTER_ALIASES: dict[str, set[str]] = {
+    "zero_on_hand": {
+        "zero_on_hand",
+        "zero",
+        "zero_stock",
+        "zero_inventory",
+        "zeroonhand",
+        "0_on_hand",
+        "0_stock",
+        "0_inventory",
+        "no_on_hand",
+        "no_onhand",
+        "no_stock",
+        "no_inventory",
+        "none_on_hand",
+        "none_onhand",
+        "out_of_stock",
+        "outofstock",
+        "stockout",
+        "stock_out",
+        "stocked_out",
+        "without_stock",
+        "without_inventory",
+        "empty_stock",
+    }
+}
+
+
+def normalize_inventory_filter_value(value) -> str | None:
+    """
+    Normalize a free-form filter label (from entities, notes, etc.) into a canonical tag.
+    """
+
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    normalized = re.sub(r"[^0-9a-z]+", "_", text).strip("_")
+    for canonical, aliases in INVENTORY_FILTER_ALIASES.items():
+        if normalized in aliases:
+            return canonical
+    return None
+
+
+def _inventory_filter_from_entities(entities: Mapping | None) -> str | None:
+    if not isinstance(entities, Mapping):
+        return None
+    filters = entities.get("filters")
+    if isinstance(filters, Mapping):
+        for key in ("inventory_status", "status", "inventory", "stock"):
+            candidate = normalize_inventory_filter_value(filters.get(key))
+            if candidate:
+                return candidate
+        for entry in filters.values():
+            candidate = normalize_inventory_filter_value(entry)
+            if candidate:
+                return candidate
+    for key in ("inventory_status", "inventory_filter", "stock_status", "status"):
+        candidate = normalize_inventory_filter_value(entities.get(key))
+        if candidate:
+            return candidate
+    return None
+
+
+def _inventory_filter_from_text(prompt: str) -> str | None:
+    normalized = " ".join(prompt.lower().split())
+    if not normalized:
+        return None
+    if any(phrase in normalized for phrase in INVENTORY_ZERO_KEY_PHRASES):
+        return "zero_on_hand"
+    zero_patterns = (
+        r"\b(?:zero|0|no)\s+(?:inventory|stock)\b",
+        r"\b(?:zero|0|no)\s+(?:qty|quantity)\s+on\s+hand\b",
+        r"\bout\s+of\s+stock\b",
+        r"\bstock\s*out\b",
+        r"\bstocked\s*out\b",
+    )
+    for pattern in zero_patterns:
+        if re.search(pattern, normalized):
+            return "zero_on_hand"
+    return None
+
+
+def detect_inventory_filter(prompt: str, context: dict | None = None) -> str | None:
+    """
+    Infer whether the user asked for a specific inventory filter (e.g., zero on hand).
+    """
+
+    if context and context.get("inventory_filter"):
+        existing = normalize_inventory_filter_value(context["inventory_filter"])
+        if existing:
+            return existing
+    entities = (context or {}).get("entities")
+    candidate = _inventory_filter_from_entities(entities)
+    if candidate:
+        return candidate
+    if context:
+        candidate = normalize_inventory_filter_value(context.get("notes"))
+        if candidate:
+            return candidate
+    return _inventory_filter_from_text(prompt)
+
+
 def asks_about_capabilities(prompt: str) -> bool:
     normalized = " ".join(prompt.lower().split())
     if not normalized:
@@ -1683,10 +2847,11 @@ def asks_about_capabilities(prompt: str) -> bool:
     return any(phrase in normalized for phrase in CAPABILITY_QUESTION_PHRASES)
 
 
-def deduce_usage_or_report_intent(prompt: str) -> str:
-    lowered = prompt.lower()
-    usage_markers = ("usage", "use", "using", "consume", "consumed", "consumption", "how much")
-    if any(marker in lowered for marker in usage_markers):
+def deduce_usage_report_or_sales_intent(prompt: str) -> str:
+    if contains_sales_intent(prompt):
+        return "sales"
+
+    if contains_usage_intent(prompt):
         return "usage"
     return "report"
 
@@ -1849,10 +3014,13 @@ def summarize_session_context(session_context: dict | None, today: datetime.date
 INTENT_ITEM_ACTIONS: dict[str, str] = {
     "usage": "usage report",
     "report": "usage report",
+    "sales": "sales report",
     "inventory": "inventory check",
+    "inventory_usage": "inventory vs usage snapshot",
     "compare": "usage comparison",
     "why_drop": "drop analysis",
-    "reorder": "reorder summary",
+    MULTI_ITEM_INTENT: "multi-item summary",
+    ALL_ITEMS_INTENT: "all-items summary",
 }
 
 
@@ -1861,6 +3029,10 @@ def build_clarification_question(intent: str, context: dict, today: datetime.dat
     Decide whether we should ask the user clarifying questions before running SQL.
     """
 
+    multi_warning = context.get("multi_intent_warning")
+    if isinstance(multi_warning, str) and multi_warning.strip():
+        return multi_warning
+
     action = INTENT_ITEM_ACTIONS.get(intent)
     if not action:
         return None
@@ -1868,16 +3040,39 @@ def build_clarification_question(intent: str, context: dict, today: datetime.dat
     prompt_has_item = bool(context.get("prompt_has_item"))
     entities = context.get("entities") or {}
     candidate_item = context.get("item") or entities.get("item")
+    inventory_filter_present = intent == "inventory" and bool(context.get("inventory_filter"))
+    prompt_candidates = context.get("prompt_item_candidates") or []
+    unique_prompt_candidates: list[str] = []
+    for token in prompt_candidates:
+        if token not in unique_prompt_candidates:
+            unique_prompt_candidates.append(token)
 
-    if not candidate_item:
-        return f"Before I run that {action}, which item number should I use?"
-    if not prompt_has_item:
+    single_item_intents = {"usage", "report", "sales", "compare", "why_drop"}
+    if (
+        intent in single_item_intents
+        and len(unique_prompt_candidates) >= 2
+        and not inventory_filter_present
+    ):
+        context["needs_item_for_intent"] = intent
+        listed = ", ".join(unique_prompt_candidates[:3])
+        if len(unique_prompt_candidates) > 3:
+            listed += ", ..."
         return (
-            f"Before I run that {action}, should I use {candidate_item}? "
-            "If you meant a different item, let me know its item number."
+            f"I noticed multiple item numbers ({listed}). "
+            f"I'm only able to run one {action} at a time, so which item should I use?"
         )
 
-    if intent not in {"usage", "report", "compare"}:
+    if not candidate_item and not inventory_filter_present:
+        context["needs_item_for_intent"] = intent
+        return f"I'm not sure which item you mean. Before I run that {action}, which item number should I use?"
+    if not prompt_has_item and candidate_item and not inventory_filter_present:
+        return (
+            f"I'm not sure if you're still asking about {candidate_item}. "
+            f"Should I keep using it for this {action}, or is there another item you have in mind?"
+        )
+
+    period_intents = {"usage", "report", "sales", "compare", MULTI_ITEM_INTENT, ALL_ITEMS_INTENT}
+    if intent not in period_intents:
         return None
 
     period_question = build_period_clarification_question(context, today)
@@ -1959,6 +3154,236 @@ def format_sql_preview(sql: str, params: Iterable) -> str:
     return preview
 
 
+def load_allowed_sql_schema(cursor: pyodbc.Cursor) -> dict[str, list[dict]]:
+    """
+    Fetch column metadata for whitelisted tables so the SQL generator has context.
+    Results are cached for the lifetime of the process.
+    """
+
+    cached = SQL_SCHEMA_CACHE.get(SQL_SCHEMA_CACHE_KEY)
+    if cached is not None:
+        return cached
+    if not CUSTOM_SQL_ALLOWED_TABLES:
+        SQL_SCHEMA_CACHE[SQL_SCHEMA_CACHE_KEY] = {}
+        return {}
+    placeholders = ", ".join("?" for _ in CUSTOM_SQL_ALLOWED_TABLES)
+    schema_query = (
+        "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE "
+        "FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME IN (" + placeholders + ") "
+        "ORDER BY TABLE_NAME, ORDINAL_POSITION"
+    )
+    try:
+        cursor.execute(schema_query, CUSTOM_SQL_ALLOWED_TABLES)
+        rows = cursor.fetchall()
+    except pyodbc.Error as err:
+        LOGGER.warning("Failed to load schema metadata for custom SQL: %s", err)
+        SQL_SCHEMA_CACHE[SQL_SCHEMA_CACHE_KEY] = {}
+        return {}
+
+    schema: dict[str, list[dict]] = {}
+    for row in rows:
+        table_name = getattr(row, "TABLE_NAME", None) or (row[0] if len(row) > 0 else None)
+        column_name = getattr(row, "COLUMN_NAME", None) or (row[1] if len(row) > 1 else None)
+        data_type = getattr(row, "DATA_TYPE", None) or (row[2] if len(row) > 2 else None)
+        if not table_name or not column_name:
+            continue
+        entry = {"name": column_name, "type": data_type}
+        schema.setdefault(table_name, []).append(entry)
+    SQL_SCHEMA_CACHE[SQL_SCHEMA_CACHE_KEY] = schema
+    return schema
+
+
+def summarize_schema_for_prompt(schema: dict[str, list[dict]], max_columns: int = 12) -> str:
+    """
+    Convert schema metadata into a compact, LLM-friendly reference block.
+    """
+
+    if not schema:
+        return ""
+    lines: list[str] = []
+    for table_name in sorted(schema):
+        columns = schema[table_name]
+        preview = columns[:max_columns]
+        column_bits = []
+        for column in preview:
+            col_name = column.get("name") or "UNKNOWN"
+            data_type = column.get("type") or "unknown"
+            column_bits.append(f"{col_name} ({data_type})")
+        if len(columns) > max_columns:
+            column_bits.append("…")
+        lines.append(f"{table_name}: {', '.join(column_bits)}")
+    return "\n".join(lines)
+
+
+def summarize_sql_context(context: dict | None) -> str:
+    """
+    Build a short description of the structured intent so the SQL generator honors it.
+    """
+
+    if not isinstance(context, dict):
+        return ""
+    pieces: list[str] = []
+    intent = context.get("intent")
+    if intent:
+        pieces.append(f"intent={intent}")
+    item = context.get("item")
+    if item:
+        pieces.append(f"item={item}")
+    month_val = context.get("month")
+    year_val = context.get("year")
+    if month_val and year_val:
+        pieces.append(f"month={month_val}, year={year_val}")
+    multiplier = context.get("multiplier")
+    if multiplier is not None:
+        pieces.append(f"multiplier={multiplier}")
+    notes = context.get("notes")
+    if notes:
+        pieces.append(f"notes={notes}")
+    entities = context.get("entities") or {}
+    filters = entities.get("filters")
+    if isinstance(filters, Mapping) and filters:
+        pieces.append("filters=" + ", ".join(f"{key}={filters[key]}" for key in filters))
+    sites = entities.get("sites")
+    if sites:
+        pieces.append(f"sites={sites}")
+    periods = entities.get("periods")
+    if periods:
+        pieces.append(f"periods={periods}")
+    return "; ".join(pieces)
+
+
+def normalize_sql_params(raw_params) -> list:
+    """
+    Ensure parameters are returned as a concrete list suitable for pyodbc.
+    """
+
+    if raw_params is None:
+        return []
+    if isinstance(raw_params, (str, bytes)):
+        return [raw_params]
+    if isinstance(raw_params, Mapping):
+        return [raw_params.get("value")]
+    if isinstance(raw_params, Iterable):
+        normalized: list = []
+        for value in raw_params:
+            if isinstance(value, (str, bytes, int, float)):
+                normalized.append(value)
+            elif isinstance(value, bool):
+                normalized.append(int(value))
+            elif value is None:
+                normalized.append(None)
+            elif isinstance(value, Mapping):
+                normalized.append(value.get("value"))
+            else:
+                normalized.append(str(value))
+        return normalized
+    return [raw_params]
+
+
+def _sanitize_table_token(token: str) -> str:
+    cleaned = token.strip()
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1]
+    if "." in cleaned:
+        cleaned = cleaned.split(".")[-1]
+    return cleaned.upper()
+
+
+def validate_custom_sql(sql: str, allowed_tables: Iterable[str]) -> tuple[bool, str | None]:
+    if not isinstance(sql, str):
+        return False, "SQL plan did not return a string."
+    cleaned = sql.strip()
+    if not cleaned:
+        return False, "SQL plan was empty."
+    lowered = cleaned.lstrip().lower()
+    if not (lowered.startswith("select") or lowered.startswith("with")):
+        return False, "Only SELECT statements are allowed."
+    upper_sql = cleaned.upper()
+    forbidden = ("INSERT ", "UPDATE ", "DELETE ", "DROP ", "ALTER ", "TRUNCATE ", "MERGE ", "EXEC ", "EXECUTE ")
+    for keyword in forbidden:
+        if keyword in upper_sql:
+            return False, f"Disallowed keyword detected ({keyword.strip()})."
+    if ";" in cleaned[:-1]:
+        return False, "Multiple SQL statements are not allowed."
+
+    allowed = {name.upper() for name in allowed_tables}
+    referenced: set[str] = set()
+    for match in SQL_TABLE_TOKEN_PATTERN.finditer(cleaned):
+        table_token = _sanitize_table_token(match.group(1))
+        if not table_token:
+            continue
+        referenced.add(table_token)
+        if allowed and table_token not in allowed:
+            return False, f"Table '{table_token}' is not allowed."
+    if allowed and referenced and not referenced.intersection(allowed):
+        return False, "SQL must reference at least one approved table."
+    return True, None
+
+
+def call_openai_sql_generator(
+    prompt: str,
+    today: datetime.date,
+    schema_summary: str,
+    context_hint: str | None = None,
+) -> dict | None:
+    """
+    Ask OpenAI to translate a free-form question into a safe, parameterized SQL query.
+    """
+
+    settings = load_openai_settings()
+    api_key = settings.get("api_key")
+    if not api_key:
+        return None
+    model = settings.get("sql_model") or settings.get("model", OPENAI_DEFAULT_MODEL)
+    system_prompt = (
+        "You convert natural-language supply-chain questions into safe, read-only T-SQL for Microsoft Dynamics GP. "
+        "Always return JSON with keys: sql (string), params (array), summary (string). "
+        "Rules: only SELECT/CTE statements, no DDL/DML, no temp tables, no multiple statements, "
+        "only reference the provided tables, and prefer parameter placeholders (?) over literal user values. "
+        f"Limit results to at most {CUSTOM_SQL_MAX_ROWS} rows using TOP or FILTER logic when reasonable."
+    )
+    user_sections = [
+        f"Current date: {today.isoformat()}",
+        "Approved tables: " + ", ".join(CUSTOM_SQL_ALLOWED_TABLES),
+    ]
+    if schema_summary:
+        user_sections.append("Schema reference:\n" + schema_summary)
+    if context_hint:
+        user_sections.append(f"Structured context: {context_hint}")
+    user_sections.append("User question:\n" + prompt.strip())
+    user_sections.append(
+        "Respond with JSON only. Params must align with each ? placeholder. "
+        "Set summary to a short human-readable description of what the SQL returns."
+    )
+    user_prompt = "\n\n".join(section for section in user_sections if section)
+    payload = {
+        "model": model,
+        "temperature": 0.0,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    try:
+        response = requests.post(
+            OPENAI_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=OPENAI_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        json_text = _extract_json_block(content)
+        return json.loads(json_text)
+    except (requests.RequestException, KeyError, json.JSONDecodeError) as err:
+        LOGGER.warning("OpenAI SQL generation failed: %s", err)
+        return None
+
+
 def _extract_json_block(text: str) -> str:
     cleaned = text.strip()
     if "```" in cleaned:
@@ -1985,16 +3410,33 @@ def call_openai_interpreter(
     system_prompt = (
         "You are a friendly supply-planning copilot for a chemical manufacturer. "
         "Hold natural conversations, but always convert each request into structured intents so downstream SQL templates know what to run. "
-        "Supported intents: 'report' (single-period usage summary), 'compare' (contrast two or more periods), "
-        "'why_drop' (explain a decline), 'inventory', 'reorder', 'usage' (legacy synonym for report), and 'chitchat' when no data is needed. "
-        "When unsure but data is requested, choose 'report'. "
+        "Supported intents: 'report' (single-period usage summary), 'sales' (customer invoice/shipment quantities), "
+        "'compare' (contrast two or more periods), 'why_drop' (explain a decline), 'inventory', "
+        "'inventory_usage' (availability vs usage snapshot), 'multi_report' (multiple items/classes or keyword-driven usage summaries), "
+        "'all_items' (catalog-wide or zero-usage summaries when no item is given), 'reorder', "
+        "'usage' (legacy synonym for report), 'custom_sql' (bespoke SQL needed for purchases/vendors/custom aggregates), "
+        "and 'chitchat' when no data is needed. "
+        "When unsure but data is requested, default to 'report' only for historical usage/lookback questions; "
+        "if the user explicitly mentions sales, invoices, shipments, or customer orders, choose 'sales'. "
+        "If the user hints at ordering, stocking, or what to buy, choose 'reorder' even if details are fuzzy. "
+        "If their request cannot be satisfied by usage/sales/inventory/reorder templates (for example purchase orders, vendor spend, multi-table joins), choose 'custom_sql'. "
         "Always emit strict JSON with keys: intent, item, month, year, multiplier, notes, reply, entities. "
         "entities must be an object capturing structured details such as item, metric, month/year, "
-        "periods (list of {\"month\": int, \"year\": int}), comparison_periods, sites, and any filters you inferred. "
+        "periods (list of {\"month\": int, \"year\": int}), comparison_periods, sites, items (list of item numbers), "
+        "item_classes (for class/category filters), and any filters you inferred. "
+        "If you infer an item from a description, note that assumption in notes/reply so downstream SQL can auto-select it. "
+        "For out-of-stock or zero on-hand list requests, set entities.filters.inventory_status to 'zero_on_hand' and keep item null unless the user names one so downstream SQL can pull all matching items. "
         "Use uppercase item codes. reply must be a concise conversational response that references what you plan to run or clarifies missing info. "
         "If the user asks what to buy or restock, choose intent 'reorder'. "
+        "If they ask for items/classes without naming a specific item (e.g., 'which items had no usage' or 'show the emulsifier class'), prefer 'all_items' or 'multi_report' as appropriate and leave item null. "
         "If they omit the item, leave item null and explain assumptions in notes. "
-        "Honor any Relevant past context that appears before the latest input."
+        "Honor any Relevant past context that appears before the latest input. "
+        "Data entities you can reference: "
+        "InventoryBalance from IV00102 joined to IV00101 with columns ITEMNMBR, ITEMDESC, ITMCLSCD, QTYONHND, ATYALLOC, QTYONORD, ORDRPNTQTY, and computed QtyAvailable (location MAIN by default unless the user specifies sites). "
+        "UsageHistory from IV30300 detail + IV30200 header where DOCTYPE=1 and TRXQTY<0 represents consumption; DOCDATE month/year drive reporting windows. "
+        "SalesShipments from SOP30300 detail + SOP30200 header where SOPTYPE=3 invoices (positive) and SOPTYPE=4 returns (negative); summarize the net quantity over DOCDATE windows. "
+        "ReorderCandidates are items where QtyAvailable < ORDRPNTQTY, and Shortfall = ORDRPNTQTY - QtyAvailable. "
+        "Mention the dataset you plan to query inside notes/reply (e.g., 'running usage SQL on IV30300 for Jan 2025'), and rely on session context defaults (item/month/year) when the user says 'same item' or 'same period'."
     )
     if feedback:
         system_prompt += f"\nUser feedback/preferences to honor: {feedback.strip()}."
@@ -2123,6 +3565,7 @@ def interpret_prompt(
     session_context: dict | None = None,
 ) -> dict:
     prior_session_intent = session_context.get("intent") if isinstance(session_context, dict) else None
+    pending_item_intent = session_context.get("needs_item_for_intent") if isinstance(session_context, dict) else None
     month_guess, year_guess = infer_period_from_text(prompt, today)
     context = {
         "intent": classify_chat_intent(prompt),
@@ -2134,15 +3577,32 @@ def interpret_prompt(
         "entities": {},
         "prompt_has_item": False,
         "followup_same_data": references_previous_data(prompt),
+        "multi_intent_warning": detect_multi_intent_usage_conflict(prompt),
     }
     prompt_item_present = bool(context["item"])
     prompt_has_data_keywords = contains_data_request_keywords(prompt)
     prompt_small_talk = looks_like_small_talk(prompt)
+    reorder_hint = looks_like_reorder_prompt(prompt)
+    context["reorder_hint"] = reorder_hint
+    context["zero_usage_focus"] = wants_zero_usage_only(prompt)
     baseline_intent = context["intent"]
-    if baseline_intent == "chitchat" and prompt_item_present and prompt_has_data_keywords:
-        baseline_intent = deduce_usage_or_report_intent(prompt)
+    if reorder_hint:
+        baseline_intent = "reorder"
+        context["intent"] = "reorder"
+    elif baseline_intent == "chitchat" and prompt_item_present and prompt_has_data_keywords:
+        baseline_intent = deduce_usage_report_or_sales_intent(prompt)
         context["intent"] = baseline_intent
+    elif prompt_has_data_keywords and context["intent"] not in {CUSTOM_SQL_INTENT, "inventory", "inventory_usage"}:
+        multi_scope_intent = None
+        if not prompt_item_present and looks_like_all_items_prompt(prompt):
+            multi_scope_intent = ALL_ITEMS_INTENT
+        elif looks_like_multi_item_prompt(prompt):
+            multi_scope_intent = MULTI_ITEM_INTENT
+        if multi_scope_intent and multi_scope_intent != baseline_intent:
+            baseline_intent = multi_scope_intent
+            context["intent"] = multi_scope_intent
     context["prompt_has_item"] = prompt_item_present
+    context["prompt_item_candidates"] = extract_item_candidates(prompt)
     raw_periods = extract_periods_from_prompt(prompt, today.year)
     prompt_periods = deduplicate_periods(raw_periods, limit=MAX_USAGE_PERIODS)
     context["prompt_periods"] = prompt_periods
@@ -2153,9 +3613,24 @@ def interpret_prompt(
     context["mentions_between_months"] = mentions_month_range(prompt)
     context["mentions_last_year"] = contains_last_year_reference(prompt)
     context["mentions_this_year"] = contains_this_year_reference(prompt)
+    if pending_item_intent:
+        context["needs_item_for_intent"] = pending_item_intent
+        lowered_prompt = prompt.lower()
+        if not prompt_item_present and any(keyword in lowered_prompt for keyword in PENDING_ITEM_RESET_KEYWORDS):
+            context["needs_item_for_intent"] = None
+            pending_item_intent = None
+        elif prompt_item_present:
+            context["needs_item_for_intent"] = None
+    followup_item_response = bool(
+        pending_item_intent and prompt_item_present and looks_like_item_followup(prompt)
+    )
+    if followup_item_response:
+        baseline_intent = pending_item_intent
+        context["intent"] = pending_item_intent
+        context["followup_same_data"] = True
 
     followup_same_data = bool(context["followup_same_data"])
-    if prior_session_intent in {"usage", "report"} and followup_same_data:
+    if prior_session_intent in {"usage", "report", "sales"} and followup_same_data:
         baseline_intent = prior_session_intent
         context["intent"] = prior_session_intent
 
@@ -2190,9 +3665,21 @@ def interpret_prompt(
 
     if llm_data.get("intent"):
         candidate = llm_data["intent"].lower()
-        allowed_intents = {"usage", "report", "compare", "why_drop", "inventory", "reorder"}
+        allowed_intents = {
+            "usage",
+            "report",
+            "sales",
+            "compare",
+            "why_drop",
+            "inventory",
+            "inventory_usage",
+            "reorder",
+            MULTI_ITEM_INTENT,
+            ALL_ITEMS_INTENT,
+            CUSTOM_SQL_INTENT,
+        }
         if candidate in allowed_intents:
-            if candidate == "inventory" and prior_session_intent in {"usage", "report"} and followup_same_data:
+            if candidate == "inventory" and prior_session_intent in {"usage", "report", "sales"} and followup_same_data:
                 context["intent"] = prior_session_intent
             else:
                 context["intent"] = candidate
@@ -2218,6 +3705,22 @@ def interpret_prompt(
         context["entities"].update(llm_data["entities"])
     if llm_data.get("reply"):
         context["reply"] = llm_data["reply"]
+    if context.get("reorder_hint") and context.get("intent") != "reorder":
+        context["intent"] = "reorder"
+    if looks_like_inventory_vs_usage_prompt(prompt) and context.get("intent") not in {"reorder", "sales"}:
+        context["intent"] = "inventory_usage"
+    if context.get("item"):
+        context["needs_item_for_intent"] = None
+
+    inventory_filter = detect_inventory_filter(prompt, context)
+    if inventory_filter:
+        context["inventory_filter"] = inventory_filter
+        if not context.get("prompt_has_item"):
+            context["item"] = None
+            entities = context.get("entities")
+            if isinstance(entities, dict):
+                entities.pop("item", None)
+            context["needs_item_for_intent"] = None
 
     return context
 
@@ -2246,8 +3749,11 @@ def latest_history_entry(history: list[dict], context_type: str | None = None) -
     return None
 
 
-def generate_chitchat_reply(prompt: str, history: list[dict]) -> str:
+def generate_chitchat_reply(prompt: str, history: list[dict], llm_reply: str | None = None) -> str:
     lowered = prompt.lower()
+    conceptual_question = looks_like_conceptual_question(prompt)
+    concept_definition = describe_gp_concept(prompt)
+
     if asks_about_capabilities(prompt):
         suggestions = build_question_suggestions(history or [])
         suggestion_block = ""
@@ -2255,11 +3761,12 @@ def generate_chitchat_reply(prompt: str, history: list[dict]) -> str:
             bullets = "\n".join(f"- {text}" for text in suggestions)
             suggestion_block = f"\n\nTry asking:\n{bullets}"
         return (
-            "I can pull GP usage for specific items, compare months or years, check current inventory, "
-            "and flag the biggest reorder gaps. "
+            "I can pull GP usage or invoiced sales for specific items, compare months or years, check current inventory, "
+            "line up availability versus usage, and flag the biggest reorder gaps. "
             "Just mention the item and timeframe you care about and I'll run the numbers."
             f"{suggestion_block}"
         )
+
     reorder_entry = latest_history_entry(history, "reorder")
     if reorder_entry and any(word in lowered for word in ("gap", "shortfall", "worst", "order point", "buy")):
         rows = reorder_entry.get("data") or []
@@ -2284,25 +3791,88 @@ def generate_chitchat_reply(prompt: str, history: list[dict]) -> str:
             f"{extra}"
         )
 
-    last_result = latest_history_entry(history, "usage") or latest_history_entry(history, "inventory")
-    if last_result and any(word in lowered for word in ("explain", "clarify", "mean", "difference", "why")):
-        return "Let me know what part of the previous table you want clarified - quantities, dates, or calculations - and I'll break it down."
+    if concept_definition:
+        return concept_definition
+
+    explanation_triggers = ("explain", "clarify", "mean", "difference", "why", "how", "what does", "tell me more")
+    needs_explanation = any(word in lowered for word in explanation_triggers)
+    explanation_contexts = (
+        "reorder",
+        "inventory",
+        "inventory_usage",
+        "usage",
+        "sales",
+        "compare",
+        "why_drop",
+        MULTI_ITEM_INTENT,
+        ALL_ITEMS_INTENT,
+        CUSTOM_SQL_INTENT,
+    )
+    last_context = None
+    last_result = None
+    if needs_explanation:
+        for context_name in explanation_contexts:
+            candidate = latest_history_entry(history, context_name)
+            if candidate:
+                last_result = candidate
+                last_context = context_name
+                break
+
+    if needs_explanation and last_result:
+        context_label_map = {
+            "reorder": "reorder summary",
+            "inventory": "inventory snapshot",
+            "inventory_usage": "availability vs usage snapshot",
+            "usage": "usage report",
+            "sales": "sales report",
+            "compare": "comparison",
+            "why_drop": "drop analysis",
+            MULTI_ITEM_INTENT: "multi-item summary",
+            ALL_ITEMS_INTENT: "all-items summary",
+        }
+        label = context_label_map.get(last_context or "", "result")
+        return (
+            f"Tell me what part of the previous {label} to walk through - quantities, time frames, or calculations - "
+            "and I'll break it down."
+        )
+
+    if conceptual_question and llm_reply:
+        return ""
+
+    if needs_explanation:
+        return (
+            "Happy to explain, but let me know which item, time frame, or metric you want clarified so I don't guess."
+        )
+
+    if conceptual_question:
+        return (
+            "I can walk through GP terms like reorder point, lead time, or safety stock - just mention the exact field you want defined."
+        )
 
     return "I'm here to help with GP data questions - add an item, month, or describe what you'd like explained and I'll dive in."
 
 
-def handle_usage_question(
-    cursor: pyodbc.Cursor, prompt: str, today: datetime.date, context: dict | None = None
+def build_item_metric_report(
+    cursor: pyodbc.Cursor,
+    prompt: str,
+    today: datetime.date,
+    context: dict | None,
+    *,
+    fetcher: Callable[[pyodbc.Cursor, str, datetime.date, datetime.date], float],
+    column_label: str,
+    insight_key: str,
+    total_key: str,
+    context_type: str,
+    sql_template: str,
 ) -> dict:
     context = context or {}
-    item_code = resolve_item_from_context(prompt, context)
+    item_code, suggestions, assumption_note = resolve_item_with_fallbacks(cursor, prompt, context)
     if not item_code:
-        suggestions = suggest_items_by_description(cursor, prompt)
         return {
             "error": "Please mention an item number (e.g., NO3CA12) so I know what to query.",
             "data": None,
             "sql": None,
-            "context_type": "usage",
+            "context_type": context_type,
             "suggestions": suggestions,
         }
 
@@ -2318,7 +3888,7 @@ def handle_usage_question(
     sql_previews: list[str] = []
     combined_start: datetime.date | None = None
     combined_end: datetime.date | None = None
-    total_usage = 0.0
+    total_value = 0.0
 
     for period in periods:
         start_date = period.get("start_date")
@@ -2327,7 +3897,7 @@ def handle_usage_question(
         if not isinstance(start_date, datetime.date) or not isinstance(end_date, datetime.date):
             continue
         display_label = label or start_date.strftime("%B %Y")
-        usage_value = fetch_usage(cursor, item_code, start_date, end_date)
+        metric_value = fetcher(cursor, item_code, start_date, end_date)
         combined_start = start_date if combined_start is None else min(combined_start, start_date)
         combined_end = end_date if combined_end is None else max(combined_end, end_date)
         row_entry = {
@@ -2335,7 +3905,7 @@ def handle_usage_question(
             "Period": display_label,
             "StartDate": start_date.isoformat(),
             "EndDate": end_date.isoformat(),
-            "Usage": usage_value,
+            column_label: metric_value,
         }
         if item_description:
             row_entry["Description"] = item_description
@@ -2343,12 +3913,12 @@ def handle_usage_question(
         period_details.append(
             {
                 "label": display_label,
-                "usage": usage_value,
+                insight_key: metric_value,
                 "granularity": period.get("granularity"),
             }
         )
-        total_usage += usage_value
-        sql_previews.append(format_sql_preview(USAGE_QUERY, (item_code, start_date, end_date)))
+        total_value += metric_value
+        sql_previews.append(format_sql_preview(sql_template, (item_code, start_date, end_date)))
 
     if len(rows) > 1:
         first_label = rows[0]["Period"]
@@ -2358,7 +3928,7 @@ def handle_usage_question(
             "Period": f"Total ({first_label} - {last_label})",
             "StartDate": combined_start.isoformat() if combined_start else None,
             "EndDate": combined_end.isoformat() if combined_end else None,
-            "Usage": total_usage,
+            column_label: total_value,
         }
         if item_description:
             total_row["Description"] = item_description
@@ -2370,11 +3940,14 @@ def handle_usage_question(
     scaled_value = None
     if multiplier is not None and rows:
         for row in rows:
-            usage_metric = row.get("Usage")
-            if isinstance(usage_metric, (int, float)):
-                row[f"Usage x {multiplier:g}"] = usage_metric * multiplier
-        base_usage = total_usage if len(period_details) > 1 else period_details[0]["usage"]
-        scaled_value = base_usage * multiplier
+            metric_amount = row.get(column_label)
+            if isinstance(metric_amount, (int, float)):
+                row[f"{column_label} x {multiplier:g}"] = metric_amount * multiplier
+        if period_details:
+            base_metric = total_value if len(period_details) > 1 else period_details[0].get(insight_key, 0.0)
+        else:
+            base_metric = 0.0
+        scaled_value = base_metric * multiplier
 
     sql_preview = "\n\n".join(sql_previews)
     if len(sql_previews) == 1:
@@ -2382,44 +3955,228 @@ def handle_usage_question(
 
     if not period_details:
         period_label = None
-        usage_value = 0.0
+        metric_for_period = 0.0
     else:
         period_label = (
-            f"{period_details[0]['label']} - {period_details[-1]['label']}"
-            if len(period_details) > 1
-            else period_details[0]["label"]
+            f"{period_details[0]['label']} - {period_details[-1]['label']}" if len(period_details) > 1 else period_details[0]["label"]
         )
-        usage_value = total_usage if len(period_details) > 1 else period_details[0]["usage"]
+        metric_for_period = total_value if len(period_details) > 1 else period_details[0].get(insight_key, 0.0)
 
     insights = {
         "item": item_code,
         "period": period_label,
-        "usage": usage_value,
+        insight_key: metric_for_period,
         "periods": period_details,
-        "total_usage": total_usage if len(period_details) > 1 else None,
+        total_key: total_value if len(period_details) > 1 else None,
+        "metric_key": insight_key,
+        "total_metric_key": total_key,
+        "period_count": len(period_details),
         "multiplier": multiplier,
         "scaled": scaled_value,
         "description": item_description,
+        "column_label": column_label,
     }
-    return {
+    if assumption_note:
+        insights["assumption_note"] = assumption_note
+    result = {
         "data": rows,
         "sql": sql_preview,
-        "context_type": "usage",
+        "context_type": context_type,
         "insights": insights,
     }
+    if suggestions:
+        result["suggestions"] = suggestions
+    return result
+
+
+def handle_usage_question(
+    cursor: pyodbc.Cursor, prompt: str, today: datetime.date, context: dict | None = None
+) -> dict:
+    return build_item_metric_report(
+        cursor,
+        prompt,
+        today,
+        context,
+        fetcher=fetch_usage,
+        column_label="Usage",
+        insight_key="usage",
+        total_key="total_usage",
+        context_type="usage",
+        sql_template=USAGE_QUERY,
+    )
+
+
+def handle_sales_question(
+    cursor: pyodbc.Cursor, prompt: str, today: datetime.date, context: dict | None = None
+) -> dict:
+    return build_item_metric_report(
+        cursor,
+        prompt,
+        today,
+        context,
+        fetcher=fetch_sales,
+        column_label="Sales",
+        insight_key="sales",
+        total_key="total_sales",
+        context_type="sales",
+        sql_template=SALES_QUERY,
+    )
+
+
+def handle_multi_item_question(
+    cursor: pyodbc.Cursor, prompt: str, today: datetime.date, context: dict | None = None
+) -> dict:
+    context = context or {}
+    start_date, end_date, period_label, resolved_periods = determine_scope_period(prompt, context, today)
+    site_codes, site_explicit, site_covers_all = resolve_site_filters(context)
+    class_filters, class_explicit, class_covers_all = resolve_class_filters(context)
+    item_list = resolve_item_list_filters(context)
+    keywords = gather_scope_keywords(prompt, context)
+    zero_focus = bool(context.get("zero_usage_focus"))
+    requested_limit = max(len(item_list), 40) if item_list else 40
+    order_mode = "abs" if zero_focus else "usage"
+    rows, sql_preview = fetch_usage_scope_rows(
+        cursor,
+        start_date,
+        end_date,
+        limit=requested_limit,
+        site_codes=site_codes,
+        site_covers_all=site_covers_all,
+        class_filters=class_filters,
+        class_covers_all=class_covers_all,
+        item_list=item_list,
+        keywords=keywords,
+        order_mode=order_mode,
+    )
+    zero_rows = [row for row in rows if abs(row.get("Usage", 0.0)) < ZERO_USAGE_EPSILON]
+    display_rows = zero_rows if zero_focus and zero_rows else rows
+    error = None
+    if not rows:
+        error = "No items matched those filters."
+    elif zero_focus and not zero_rows:
+        error = f"No items were completely idle during {period_label}."
+    scope_note = build_scope_note(
+        site_codes,
+        site_explicit,
+        site_covers_all,
+        class_filters,
+        class_explicit,
+        class_covers_all,
+    )
+    insights = {
+        "period": period_label,
+        "row_count": len(display_rows),
+        "scanned_count": len(rows),
+        "zero_focus": zero_focus,
+        "zero_item_count": len(zero_rows),
+        "top_item": display_rows[0] if display_rows else None,
+        "sites": site_codes,
+        "site_explicit": site_explicit,
+        "site_covers_all": site_covers_all,
+        "class_filters": class_filters,
+        "class_explicit": class_explicit,
+        "class_covers_all": class_covers_all,
+        "item_filters": item_list,
+        "keywords": keywords,
+        "periods": resolved_periods,
+        "limit": requested_limit,
+        "period_start": start_date.isoformat(),
+        "period_end": end_date.isoformat(),
+    }
+    if scope_note:
+        insights["scope_note"] = scope_note
+    result = {
+        "data": display_rows,
+        "sql": sql_preview,
+        "context_type": MULTI_ITEM_INTENT,
+        "insights": insights,
+    }
+    if error:
+        result["error"] = error
+    return result
+
+
+def handle_all_items_question(
+    cursor: pyodbc.Cursor, prompt: str, today: datetime.date, context: dict | None = None
+) -> dict:
+    context = context or {}
+    start_date, end_date, period_label, resolved_periods = determine_scope_period(prompt, context, today)
+    site_codes, site_explicit, site_covers_all = resolve_site_filters(context)
+    class_filters, class_explicit, class_covers_all = resolve_class_filters(context)
+    keywords = gather_scope_keywords(prompt, context)
+    zero_focus = bool(context.get("zero_usage_focus"))
+    rows, sql_preview = fetch_usage_scope_rows(
+        cursor,
+        start_date,
+        end_date,
+        limit=75,
+        site_codes=site_codes,
+        site_covers_all=site_covers_all,
+        class_filters=class_filters,
+        class_covers_all=class_covers_all,
+        item_list=None,
+        keywords=keywords,
+        order_mode="abs" if zero_focus else "usage",
+    )
+    zero_rows = [row for row in rows if abs(row.get("Usage", 0.0)) < ZERO_USAGE_EPSILON]
+    active_rows = [row for row in rows if abs(row.get("Usage", 0.0)) >= ZERO_USAGE_EPSILON]
+    top_consumers = rows[:3] if not zero_focus else zero_rows[:3]
+    error = None
+    if not rows:
+        error = "I could not build an all-items summary for that timeframe."
+    elif zero_focus and not zero_rows:
+        error = f"No items were completely idle during {period_label}."
+    scope_note = build_scope_note(
+        site_codes,
+        site_explicit,
+        site_covers_all,
+        class_filters,
+        class_explicit,
+        class_covers_all,
+    )
+    insights = {
+        "period": period_label,
+        "row_count": len(rows),
+        "zero_item_count": len(zero_rows),
+        "active_item_count": len(active_rows),
+        "zero_focus": zero_focus,
+        "top_items": top_consumers,
+        "sites": site_codes,
+        "site_explicit": site_explicit,
+        "site_covers_all": site_covers_all,
+        "class_filters": class_filters,
+        "class_explicit": class_explicit,
+        "class_covers_all": class_covers_all,
+        "keywords": keywords,
+        "periods": resolved_periods,
+        "period_start": start_date.isoformat(),
+        "period_end": end_date.isoformat(),
+    }
+    if scope_note:
+        insights["scope_note"] = scope_note
+    result = {
+        "data": zero_rows if zero_focus and zero_rows else rows,
+        "sql": sql_preview,
+        "context_type": ALL_ITEMS_INTENT,
+        "insights": insights,
+    }
+    if error:
+        result["error"] = error
+    return result
 
 
 def handle_compare_question(
     cursor: pyodbc.Cursor, prompt: str, today: datetime.date, context: dict | None = None
 ) -> dict:
     context = context or {}
-    item_code = resolve_item_from_context(prompt, context)
+    item_code, suggestions, assumption_note = resolve_item_with_fallbacks(cursor, prompt, context)
     if not item_code:
         return {
             "error": "Please specify an item to compare usage across months.",
             "data": None,
             "sql": None,
             "context_type": "compare",
+            "suggestions": suggestions,
         }
 
     month = context.get("month")
@@ -2493,6 +4250,8 @@ def handle_compare_question(
         "difference": difference,
         "percent_change": percent_change,
     }
+    if assumption_note:
+        insights["assumption_note"] = assumption_note
     return {
         "data": rows,
         "sql": sql_preview,
@@ -2519,13 +4278,14 @@ def handle_why_drop_question(
     cursor: pyodbc.Cursor, prompt: str, today: datetime.date, context: dict | None = None
 ) -> dict:
     context = context or {}
-    item_code = resolve_item_from_context(prompt, context)
+    item_code, suggestions, assumption_note = resolve_item_with_fallbacks(cursor, prompt, context)
     if not item_code:
         return {
             "error": "Please mention which item dropped so I can review its history.",
             "data": None,
             "sql": None,
             "context_type": "why_drop",
+            "suggestions": suggestions,
         }
 
     month = context.get("month")
@@ -2604,6 +4364,8 @@ def handle_why_drop_question(
         "drop_percent": drop_percent,
         "worst_drop": worst_drop,
     }
+    if assumption_note:
+        insights["assumption_note"] = assumption_note
     return {
         "data": rows,
         "sql": sql_preview,
@@ -2614,20 +4376,66 @@ def handle_why_drop_question(
 
 def handle_inventory_question(cursor: pyodbc.Cursor, prompt: str, context: dict | None = None) -> dict:
     context = context or {}
+    suggestion_pool: list[dict] = []
+    assumption_note = None
     item_code = context.get("item") or extract_item_code(prompt)
-    base_query = """
-        SELECT TOP 25 i.ITEMNMBR, m.ITEMDESC, i.QTYONHND, i.QTYONORD,
-               (i.QTYONHND - i.ATYALLOC) AS QtyAvailable, i.ORDRPNTQTY, m.ITMCLSCD
+    if not item_code:
+        resolved_item, suggestion_pool, assumption_note = resolve_item_with_fallbacks(cursor, prompt, context)
+        if resolved_item:
+            item_code = resolved_item
+    inventory_filter = context.get("inventory_filter") or detect_inventory_filter(prompt, context)
+    if inventory_filter and not context.get("inventory_filter"):
+        context["inventory_filter"] = inventory_filter
+    site_codes, site_explicit, site_covers_all = resolve_site_filters(context)
+    class_filters, class_explicit, class_covers_all = resolve_class_filters(context)
+    prompt_filters = extract_inventory_filters(prompt, context)
+    prompt_class = prompt_filters.get("item_class")
+    below_order_point = bool(prompt_filters.get("below_order_point"))
+    zero_on_hand = inventory_filter == "zero_on_hand"
+
+    if isinstance(prompt_class, str) and prompt_class.strip():
+        if prompt_class not in class_filters:
+            class_filters.append(prompt_class)
+        class_explicit = True
+        class_covers_all = False
+
+    limit_results = not (class_filters or below_order_point or zero_on_hand)
+    select_hint = "TOP 25 " if limit_results else ""
+    base_query = f"""
+        SELECT {select_hint}i.ITEMNMBR, m.ITEMDESC, i.QTYONHND, i.QTYONORD,
+               (i.QTYONHND - i.ATYALLOC) AS QtyAvailable, i.ORDRPNTQTY, m.ITMCLSCD,
+               (i.ORDRPNTQTY - (i.QTYONHND - i.ATYALLOC)) AS Shortfall
         FROM IV00102 i
         JOIN IV00101 m ON m.ITEMNMBR = i.ITEMNMBR
-        WHERE i.LOCNCODE = 'MAIN'
+        WHERE 1=1
     """
     params: list = []
 
+    if site_codes and not site_covers_all:
+        placeholders = ", ".join("?" for _ in site_codes)
+        base_query += f"  AND i.LOCNCODE IN ({placeholders})"
+        params.extend(site_codes)
     if item_code:
         base_query += " AND i.ITEMNMBR = ?"
         params.append(item_code)
-    base_query += " ORDER BY i.ORDRPNTQTY DESC"
+    if class_filters and not class_covers_all:
+        class_clauses = []
+        for _ in class_filters:
+            class_clauses.append("m.ITMCLSCD LIKE ?")
+        base_query += " AND (" + " OR ".join(class_clauses) + ")"
+        params.extend(_wildcard_value(value) for value in class_filters)
+    if below_order_point:
+        base_query += " AND (i.QTYONHND - i.ATYALLOC) < i.ORDRPNTQTY"
+    if zero_on_hand:
+        base_query += " AND i.QTYONHND <= 0"
+
+    if below_order_point:
+        order_clause = " ORDER BY (i.ORDRPNTQTY - (i.QTYONHND - i.ATYALLOC)) DESC"
+    elif zero_on_hand:
+        order_clause = " ORDER BY m.ITEMDESC, i.ITEMNMBR"
+    else:
+        order_clause = " ORDER BY i.ORDRPNTQTY DESC"
+    base_query += order_clause
 
     cursor.execute(base_query, params)
     fetched = cursor.fetchall()
@@ -2644,23 +4452,80 @@ def handle_inventory_question(cursor: pyodbc.Cursor, prompt: str, context: dict 
                 "Avail": record.get("QtyAvailable", getattr(raw_row, "QtyAvailable", None)),
                 "OrderPoint": record.get("ORDRPNTQTY", getattr(raw_row, "ORDRPNTQTY", None)),
                 "Class": record.get("ITMCLSCD", getattr(raw_row, "ITMCLSCD", None)),
+                "Shortfall": record.get("Shortfall", getattr(raw_row, "Shortfall", None)),
             }
         )
 
-    sql_preview = format_sql_preview(base_query, params) if params else base_query
+    sql_preview = format_sql_preview(base_query, params)
+    if below_order_point:
+        sort_label = "shortfall vs order point"
+    elif zero_on_hand:
+        sort_label = "item number"
+    else:
+        sort_label = "order point"
     insights = {
         "item": item_code,
         "row_count": len(rows),
         "sample": rows[0] if rows else None,
+        "sites": site_codes,
+        "site_explicit": site_explicit,
+        "site_covers_all": site_covers_all,
+        "class_filters": class_filters,
+        "class_explicit": class_explicit,
+        "class_covers_all": class_covers_all,
+        "below_order_point": below_order_point,
+        "limited": limit_results,
+        "sort": sort_label,
+        "filter": inventory_filter,
     }
+    if assumption_note:
+        insights["assumption_note"] = assumption_note
     suggestions: list[dict] = []
     error = None
+    scope_note = build_scope_note(
+        site_codes,
+        site_explicit,
+        site_covers_all,
+        class_filters,
+        class_explicit,
+        class_covers_all,
+    )
+    if scope_note:
+        insights["scope_note"] = scope_note
     if not rows:
-        if item_code:
-            suggestions = suggest_items_by_description(cursor, prompt)
-            error = f"I could not find inventory rows for {item_code} at MAIN."
+        site_phrase = site_error_clause(site_codes, site_covers_all)
+        class_phrase = ""
+        if class_explicit and class_filters:
+            class_phrase = f" (Class filter: {describe_class_scope(class_filters, False)}.)"
+        if zero_on_hand and not item_code:
+            error = "No items with zero on hand"
+            if site_phrase:
+                error += f" {site_phrase}"
+            error += "."
+            if class_phrase:
+                error += class_phrase
+            if scope_note:
+                error = f"{error} {scope_note}"
+        elif item_code:
+            suggestions = suggestion_pool or suggest_items_by_description(cursor, prompt)
+            error = f"I could not find inventory rows for {item_code}"
+            if site_phrase:
+                error += f" {site_phrase}"
+            error += "."
+            if scope_note:
+                error = f"{error} {scope_note}"
         else:
-            error = "No inventory rows matched. Try a different item or remove filters."
+            if site_phrase:
+                error = f"No inventory rows matched {site_phrase}."
+            else:
+                error = "No inventory rows matched."
+            if class_phrase:
+                error += class_phrase
+            elif class_explicit and class_covers_all:
+                error += " (All classes included per your request.)"
+            error += " Try a different item or remove filters."
+            if scope_note:
+                error = f"{error} {scope_note}"
     return {
         "data": rows,
         "sql": sql_preview,
@@ -2671,19 +4536,123 @@ def handle_inventory_question(cursor: pyodbc.Cursor, prompt: str, context: dict 
     }
 
 
+def handle_inventory_usage_question(
+    cursor: pyodbc.Cursor, prompt: str, today: datetime.date, context: dict | None = None
+) -> dict:
+    context = context or {}
+    item_code, suggestions, assumption_note = resolve_item_with_fallbacks(cursor, prompt, context)
+    if not item_code:
+        return {
+            "error": "Please mention an item number (e.g., NO3CA12) so I can line up availability vs usage.",
+            "data": None,
+            "sql": None,
+            "context_type": "inventory_usage",
+            "suggestions": suggestions,
+        }
+    context["item"] = context.get("item") or item_code
+
+    inventory_payload = handle_inventory_question(cursor, prompt, context)
+    rows = inventory_payload.get("data") or []
+    if not rows:
+        return {
+            "error": inventory_payload.get("error")
+            or f"I could not find inventory rows for {item_code} with the current filters.",
+            "data": None,
+            "sql": inventory_payload.get("sql"),
+            "context_type": "inventory_usage",
+            "suggestions": inventory_payload.get("suggestions"),
+        }
+    inventory_row = next((row for row in rows if row.get("Item") == item_code), rows[0])
+
+    usage_periods = determine_usage_periods(prompt, context, today) or []
+    if not usage_periods:
+        usage_periods = [build_month_usage_period(today.month, today.year)]
+    primary_period: UsagePeriod = usage_periods[0]
+    start_date = primary_period["start_date"]
+    end_date = primary_period["end_date"]
+    usage_value = fetch_usage(cursor, item_code, start_date, end_date)
+    usage_summary = {
+        "Item": item_code,
+        "Label": primary_period["label"],
+        "StartDate": start_date.isoformat(),
+        "EndDate": end_date.isoformat(),
+        "Usage": usage_value,
+    }
+
+    avail_value = inventory_row.get("Avail")
+    order_point = inventory_row.get("OrderPoint")
+    coverage_months = None
+    usage_magnitude = abs(usage_value) if isinstance(usage_value, Number) else None
+    if isinstance(avail_value, Number) and isinstance(usage_magnitude, Number):
+        if usage_magnitude > 0 and primary_period.get("granularity") == "month":
+            coverage_months = avail_value / usage_magnitude
+    order_point_gap = None
+    if isinstance(avail_value, Number) and isinstance(order_point, Number):
+        order_point_gap = avail_value - order_point
+
+    usage_sql = format_sql_preview(USAGE_QUERY, (item_code, start_date, end_date))
+    inventory_sql = inventory_payload.get("sql") or ""
+    combined_sql = usage_sql if not inventory_sql else f"{inventory_sql}\n\n{usage_sql}"
+    base_insights = inventory_payload.get("insights") or {}
+    insights = {
+        "item": item_code,
+        "inventory": inventory_row,
+        "usage": usage_summary,
+        "coverage_months": coverage_months,
+        "order_point_gap": order_point_gap,
+        "sites": base_insights.get("sites"),
+        "site_explicit": base_insights.get("site_explicit"),
+        "site_covers_all": base_insights.get("site_covers_all"),
+        "class_filters": base_insights.get("class_filters"),
+        "class_explicit": base_insights.get("class_explicit"),
+        "class_covers_all": base_insights.get("class_covers_all"),
+    }
+    if assumption_note:
+        insights["assumption_note"] = assumption_note
+    return {
+        "data": {
+            "inventory": inventory_row,
+            "usage": usage_summary,
+        },
+        "sql": combined_sql,
+        "context_type": "inventory_usage",
+        "insights": insights,
+        "suggestions": inventory_payload.get("suggestions"),
+    }
+
+
 def handle_reorder_question(
     cursor: pyodbc.Cursor, prompt: str, today: datetime.date, context: dict | None = None
 ) -> dict:
     context = context or {}
-    item_code = resolve_item_from_context(prompt, context)
+    suggestion_pool: list[dict] = []
+    assumption_note = None
+    item_code = context.get("item") or extract_item_code(prompt)
+    if not item_code:
+        resolved_item, suggestion_pool, assumption_note = resolve_item_with_fallbacks(cursor, prompt, context)
+        if resolved_item:
+            item_code = resolved_item
+    site_codes, site_explicit, site_covers_all = resolve_site_filters(context)
+    class_filters, class_explicit, class_covers_all = resolve_class_filters(context)
     params: list = []
-    query = REORDER_QUERY
+    where_clauses = ["(i.QTYONHND - i.ATYALLOC) < i.ORDRPNTQTY"]
+    if site_codes and not site_covers_all:
+        placeholders = ", ".join("?" for _ in site_codes)
+        where_clauses.append(f"i.LOCNCODE IN ({placeholders})")
+        params.extend(site_codes)
+    if class_filters and not class_covers_all:
+        class_clauses = ["m.ITMCLSCD LIKE ?" for _ in class_filters]
+        where_clauses.append("(" + " OR ".join(class_clauses) + ")")
+        params.extend(_wildcard_value(value) for value in class_filters)
     if item_code:
-        query = REORDER_QUERY.replace(
-            "ORDER BY Shortfall DESC;",
-            "  AND i.ITEMNMBR = ?\nORDER BY Shortfall DESC;",
-        )
+        where_clauses.append("i.ITEMNMBR = ?")
         params.append(item_code)
+    query = (
+        REORDER_QUERY
+        + "\nWHERE "
+        + "\n  AND ".join(where_clauses)
+        + "\nORDER BY Shortfall DESC;"
+    )
 
     cursor.execute(query, params)
     fetched = cursor.fetchall()
@@ -2706,15 +4675,52 @@ def handle_reorder_question(
         "count": len(rows),
         "top_row": rows[0] if rows else None,
         "item": item_code,
+        "sites": site_codes,
+        "site_explicit": site_explicit,
+        "site_covers_all": site_covers_all,
+        "class_filters": class_filters,
+        "class_explicit": class_explicit,
+        "class_covers_all": class_covers_all,
     }
+    if assumption_note:
+        insights["assumption_note"] = assumption_note
     suggestions: list[dict] = []
     error = None
+    scope_note = build_scope_note(
+        site_codes,
+        site_explicit,
+        site_covers_all,
+        class_filters,
+        class_explicit,
+        class_covers_all,
+    )
+    if scope_note:
+        insights["scope_note"] = scope_note
     if not rows:
         if item_code:
-            error = f"I could not find reorder data for {item_code} at MAIN."
-            suggestions = suggest_items_by_description(cursor, prompt)
+            scope_bits: list[str] = []
+            site_phrase = site_error_clause(site_codes, site_covers_all)
+            if site_phrase:
+                scope_bits.append(site_phrase)
+            if class_explicit:
+                if class_covers_all:
+                    scope_bits.append("across all classes")
+                elif class_filters:
+                    scope_bits.append(f"within classes {describe_class_scope(class_filters, False)}")
+            scope_text = (" " + " ".join(scope_bits)) if scope_bits else ""
+            error = f"I could not find reorder data for {item_code}{scope_text}."
+            if scope_note:
+                error = f"{error} {scope_note}"
+            suggestions = suggestion_pool or suggest_items_by_description(cursor, prompt)
         else:
-            error = "All MAIN items meet their order points right now."
+            site_label = describe_site_scope(site_codes, site_covers_all) or "these locations"
+            error = f"All {site_label} items meet their order points right now."
+            if class_explicit and class_filters:
+                error += f" (Class filter: {describe_class_scope(class_filters, False)}.)"
+            elif class_explicit and class_covers_all:
+                error += " (All classes included per your request.)"
+            if scope_note:
+                error = f"{error} {scope_note}"
         return {
             "data": rows,
             "sql": sql_preview,
@@ -2857,6 +4863,109 @@ def describe_usage_message(insights: dict | None) -> str:
     return " ".join(message_parts) if message_parts else "Usage results are ready."
 
 
+def describe_sales_message(insights: dict | None) -> str:
+    if not insights:
+        return "I could not calculate sales for that request."
+    item = insights.get("item")
+    description = insights.get("description")
+    period = insights.get("period")
+    sales_value = insights.get("sales")
+    periods = insights.get("periods") or []
+    total_sales = insights.get("total_sales")
+    message_parts: list[str] = []
+    if item and description:
+        item_label = f"{item} ({description})"
+    elif description and not item:
+        item_label = description
+    else:
+        item_label = item
+
+    if isinstance(periods, list) and len(periods) > 1:
+        per_texts: list[str] = []
+        for entry in periods:
+            label = entry.get("label")
+            value = entry.get("sales")
+            if label and isinstance(value, (int, float)):
+                per_texts.append(f"{label}: {value:,.2f} units invoiced")
+        if per_texts:
+            prefix = f"{item_label} sales by period" if item_label else "Sales by period"
+            message_parts.append(f"{prefix} - " + "; ".join(per_texts) + ". Returns reduce the totals.")
+        if isinstance(total_sales, (int, float)):
+            start_label = periods[0].get("label")
+            end_label = periods[-1].get("label")
+            if start_label and end_label:
+                range_label = f"{start_label} - {end_label}" if start_label != end_label else start_label
+            else:
+                range_label = "the requested range"
+            message_parts.append(f"Total invoiced for {range_label}: {total_sales:,.2f} units.")
+    else:
+        if item_label and period and isinstance(sales_value, (int, float)):
+            message_parts.append(f"{item_label} sales for {period}: {sales_value:,.2f} units invoiced.")
+        elif isinstance(sales_value, (int, float)):
+            message_parts.append(f"Sales for the requested period: {sales_value:,.2f} units invoiced.")
+
+    multiplier = insights.get("multiplier")
+    scaled = insights.get("scaled")
+    if multiplier is not None and isinstance(scaled, (int, float)):
+        message_parts.append(f"Multiplying by {multiplier:g} yields {scaled:,.2f}.")
+    return " ".join(message_parts) if message_parts else "Sales results are ready."
+
+
+def describe_multi_item_message(insights: dict | None) -> str:
+    if not insights:
+        return "I could not summarize multiple items for that scope."
+    period = insights.get("period") or "the requested window"
+    row_count = insights.get("row_count")
+    zero_focus = insights.get("zero_focus")
+    zero_count = insights.get("zero_item_count")
+    top_item = insights.get("top_item") or {}
+    message_parts: list[str] = []
+    if row_count:
+        message_parts.append(f"I pulled {row_count} items for {period}.")
+    if zero_focus:
+        if zero_count:
+            message_parts.append(f"{zero_count} item(s) showed zero usage.")
+        else:
+            message_parts.append("None of the items were completely idle.")
+    if isinstance(top_item, dict):
+        item_code = top_item.get("Item")
+        usage_value = top_item.get("Usage")
+        if item_code and isinstance(usage_value, (int, float)):
+            descriptor = "lowest usage" if zero_focus else "highest usage"
+            message_parts.append(f"{descriptor.title()}: {item_code} at {usage_value:,.2f} units.")
+    scope_note = insights.get("scope_note")
+    if scope_note:
+        message_parts.append(scope_note)
+    return " ".join(message_parts) if message_parts else "Multi-item summary is ready."
+
+
+def describe_all_items_message(insights: dict | None) -> str:
+    if not insights:
+        return "I could not build the all-items summary."
+    period = insights.get("period") or "the requested window"
+    zero_count = insights.get("zero_item_count")
+    active_count = insights.get("active_item_count")
+    top_items = insights.get("top_items") or []
+    message_parts: list[str] = [f"All-items summary for {period} is ready."]
+    if zero_count is not None:
+        message_parts.append(f"{zero_count} item(s) had no usage.")
+    if active_count is not None:
+        message_parts.append(f"{active_count} item(s) showed activity.")
+    if isinstance(top_items, list) and top_items:
+        highlights = []
+        for entry in top_items[:2]:
+            item_code = entry.get("Item")
+            usage_value = entry.get("Usage")
+            if item_code and isinstance(usage_value, (int, float)):
+                highlights.append(f"{item_code}: {usage_value:,.2f}")
+        if highlights:
+            message_parts.append("Top movers: " + ", ".join(highlights) + ".")
+    scope_note = insights.get("scope_note")
+    if scope_note:
+        message_parts.append(scope_note)
+    return " ".join(message_parts)
+
+
 def describe_compare_message(insights: dict | None) -> str:
     if not insights:
         return "Comparison results are ready."
@@ -2927,12 +5036,38 @@ def describe_inventory_message(insights: dict | None) -> str:
     row_count = insights.get("row_count", 0) or 0
     raw_sample = insights.get("sample")
     sample = raw_sample if isinstance(raw_sample, dict) else {}
+    site_codes = insights.get("sites") or []
+    site_covers_all = bool(insights.get("site_covers_all"))
+    site_label = describe_site_scope(site_codes, site_covers_all) or "the requested scope"
+    scope_note = insights.get("scope_note")
+    class_filters = insights.get("class_filters") or []
+    class_covers_all = bool(insights.get("class_covers_all"))
+    class_label = describe_class_scope(class_filters, class_covers_all)
+    below_order_point = bool(insights.get("below_order_point"))
+    limited = bool(insights.get("limited"))
+    sort_label = insights.get("sort") or ("shortfall vs order point" if below_order_point else "order point")
+    filter_key = insights.get("filter")
+    zero_on_hand = filter_key == "zero_on_hand"
+
+    filter_bits: list[str] = []
+    if class_label:
+        filter_bits.append("all classes" if class_covers_all else f"class {class_label}")
+    if below_order_point:
+        filter_bits.append("below their order point")
+    if zero_on_hand:
+        filter_bits.append("zero on hand")
+    filter_summary = human_join(filter_bits)
+
     if row_count == 0:
         if item:
-            return f"I could not find inventory rows for {item} at MAIN."
-        return "No inventory rows matched the filters."
+            message = f"I could not find inventory rows for {item}."
+        else:
+            message = "No inventory rows matched the filters."
+        if scope_note:
+            message = f"{message} {scope_note}"
+        return message.strip()
     if item and isinstance(sample, dict):
-        parts = [f"Inventory snapshot for {item} at MAIN."]
+        parts = [f"Inventory snapshot for {item} ({site_label})."]
         avail = sample.get("Avail")
         order_point = sample.get("OrderPoint")
         if isinstance(avail, (int, float)) and isinstance(order_point, (int, float)):
@@ -2943,16 +5078,82 @@ def describe_inventory_message(insights: dict | None) -> str:
         on_order = sample.get("OnOrder")
         if isinstance(on_order, (int, float)):
             parts.append(f"On order {on_order:,.0f}.")
+        if scope_note:
+            parts.append(scope_note)
         return " ".join(parts).strip()
-    return f"Top {row_count} MAIN items ordered by order point. Use an item number to drill in further."
+
+    scope_fragment = f" for {site_label}" if site_label else ""
+    if filter_summary:
+        summary = f"{row_count} items{scope_fragment} matched the filters ({filter_summary})."
+        if sort_label:
+            summary += f" Sorted by {sort_label}."
+        if scope_note:
+            summary = f"{summary} {scope_note}"
+        return summary.strip()
+
+    summary = (
+        f"Top {row_count} items{scope_fragment} ordered by {sort_label}."
+        if limited
+        else f"{row_count} items{scope_fragment} ordered by {sort_label}."
+    )
+    if scope_note:
+        summary = f"{summary} {scope_note}"
+    return summary + " Use an item number to drill in further."
+
+
+def describe_inventory_usage_message(insights: dict | None) -> str:
+    if not insights:
+        return "Inventory and usage snapshot is ready."
+    item = insights.get("item")
+    inventory = insights.get("inventory") or {}
+    usage_info = insights.get("usage") or {}
+    parts: list[str] = []
+    if item:
+        parts.append(f"{item} availability vs usage.")
+    avail = inventory.get("Avail")
+    order_point = inventory.get("OrderPoint")
+    if isinstance(avail, Number) and isinstance(order_point, Number):
+        gap = avail - order_point
+        relation = "above" if gap >= 0 else "below"
+        parts.append(
+            f"{avail:,.0f} available vs {order_point:,.0f} order point "
+            f"({abs(gap):,.0f} {relation})."
+        )
+    elif isinstance(avail, Number):
+        parts.append(f"{avail:,.0f} available today.")
+    usage_value = usage_info.get("Usage")
+    usage_label = usage_info.get("Label") or usage_info.get("Period")
+    if isinstance(usage_value, Number) and usage_label:
+        parts.append(f"{usage_label} usage {abs(usage_value):,.0f} units.")
+    coverage = insights.get("coverage_months")
+    if isinstance(coverage, Number) and coverage > 0:
+        parts.append(f"That covers roughly {coverage:.1f} months at the latest usage rate.")
+    elif isinstance(coverage, Number) and coverage == 0:
+        parts.append("No recent usage was recorded, so coverage is unlimited for now.")
+    elif isinstance(coverage, Number) and coverage < 0:
+        parts.append(f"Usage outpaced availability by {abs(coverage):.1f} months.")
+    order_point_gap = insights.get("order_point_gap")
+    if isinstance(order_point_gap, Number) and not (
+        isinstance(avail, Number) and isinstance(order_point, Number)
+    ):
+        relation = "above" if order_point_gap >= 0 else "below"
+        parts.append(f"Availability is {abs(order_point_gap):,.0f} units {relation} the order point.")
+    return " ".join(part.strip() for part in parts if part).strip() or "Inventory and usage snapshot is ready."
 
 
 def describe_reorder_message(insights: dict | None) -> str:
     if not insights:
         return "Unable to summarize the reorder list."
     count = insights.get("count", 0) or 0
+    site_codes = insights.get("sites") or []
+    site_covers_all = bool(insights.get("site_covers_all"))
+    site_label = describe_site_scope(site_codes, site_covers_all) or "the requested scope"
+    scope_note = insights.get("scope_note")
     if count == 0:
-        return "All MAIN items meet their order points right now."
+        message = f"All {site_label} items meet their order points right now."
+        if scope_note:
+            message = f"{message} {scope_note}"
+        return message.strip()
     top_row = insights.get("top_row")
     if not isinstance(top_row, dict):
         top_row = {}
@@ -2971,7 +5172,7 @@ def describe_reorder_message(insights: dict | None) -> str:
             elif isinstance(avail, Number):
                 availability_note = f"{avail:,.0f} available today"
             base_sentence = (
-                f"{requested_item} needs {abs(shortfall):,.0f} units to reach its {order_point:,.0f} order point"
+                f"{requested_item} ({site_label}) needs {abs(shortfall):,.0f} units to reach its {order_point:,.0f} order point"
             )
             if availability_note:
                 base_sentence += f" ({availability_note})."
@@ -3003,6 +5204,8 @@ def describe_reorder_message(insights: dict | None) -> str:
                 parts.append(
                     f"I'd plan on ordering around {recommended:,.0f} units (max of usage coverage vs order-point shortfall)."
                 )
+        if scope_note:
+            parts.append(scope_note)
         return " ".join(part for part in parts if part).strip()
 
     item = top_row.get("Item")
@@ -3010,7 +5213,7 @@ def describe_reorder_message(insights: dict | None) -> str:
     order_point = top_row.get("OrderPoint")
     avail = top_row.get("Avail")
     message = [
-        f"{count} items are below their order point.",
+        f"{count} items are below their order point for {site_label}.",
         "Worst gaps first means the table is sorted by shortfall (order point minus available quantity) so the most urgent misses float to the top.",
     ]
     if item:
@@ -3020,7 +5223,282 @@ def describe_reorder_message(insights: dict | None) -> str:
             )
         else:
             message.append(f"{item} currently shows the largest shortfall.")
+    if scope_note:
+        message.append(scope_note)
     return " ".join(message)
+
+
+def _safe_float(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number):
+        return None
+    return number
+
+
+def _extract_metric_series(insights: Mapping | None) -> tuple[list[tuple[str, float]], str | None, float | None]:
+    if not isinstance(insights, Mapping):
+        return [], None, None
+    metric_key = insights.get("metric_key")
+    if not isinstance(metric_key, str):
+        for candidate in ("usage", "sales"):
+            if candidate in insights:
+                metric_key = candidate
+                break
+    periods = insights.get("periods") or []
+    series: list[tuple[str, float]] = []
+    if metric_key:
+        for entry in periods:
+            if not isinstance(entry, Mapping):
+                continue
+            label = entry.get("label")
+            value = entry.get(metric_key)
+            if label and isinstance(value, (int, float)):
+                series.append((label, float(value)))
+    total_key = insights.get("total_metric_key")
+    if not isinstance(total_key, str) and isinstance(metric_key, str):
+        guessed_key = f"total_{metric_key}"
+        if guessed_key in insights:
+            total_key = guessed_key
+    if not isinstance(total_key, str):
+        for fallback in ("total_usage", "total_sales"):
+            if fallback in insights:
+                total_key = fallback
+                break
+    total_value = None
+    if isinstance(total_key, str):
+        total_raw = insights.get(total_key)
+        if isinstance(total_raw, (int, float)):
+            total_value = float(total_raw)
+    column_label = insights.get("column_label")
+    if not isinstance(column_label, str) and isinstance(metric_key, str):
+        column_label = metric_key.title()
+    return series, column_label, total_value
+
+
+def _build_metric_choice_note(lowered_prompt: str, intent: str | None) -> str:
+    normalized_intent = (intent or "").lower()
+    mentions_sales = any(keyword in lowered_prompt for keyword in SALES_INTENT_KEYWORDS)
+    mentions_usage = any(keyword in lowered_prompt for keyword in USAGE_METRIC_KEYWORDS)
+    if mentions_sales and normalized_intent in {"usage", "report"}:
+        return (
+            "Usage looks at GP inventory adjustments/consumption (negative values mean product left stock). "
+            "Ask for sales or invoices if you need customer shipment totals."
+        )
+    if mentions_usage and normalized_intent == "sales":
+        return (
+            "Sales intent returns SOP invoices and shipments. "
+            "If you were looking for manufacturing or inventory usage, rerun as a usage report."
+        )
+    return ""
+
+
+def _build_period_scope_note(
+    lowered_prompt: str,
+    context: Mapping | None,
+    insights: Mapping | None,
+) -> str:
+    series, column_label, total_value = _extract_metric_series(insights)
+    if not series:
+        return ""
+    metric_label = (column_label or "usage").lower()
+    period_count = len(series)
+    mentions_total = any(keyword in lowered_prompt for keyword in TOTAL_SCOPE_KEYWORDS)
+    if period_count > 1:
+        start_label = series[0][0]
+        end_label = series[-1][0]
+        coverage = start_label if start_label == end_label else f"{start_label} - {end_label}"
+        parts = [f"Coverage spans {period_count} periods ({coverage})"]
+        if total_value is not None:
+            parts[-1] += f" totaling {total_value:,.2f} {metric_label}"
+        parts[-1] += "."
+        highest = max(series, key=lambda entry: entry[1])
+        lowest = min(series, key=lambda entry: entry[1])
+        if highest[1] != lowest[1]:
+            parts.append(
+                f"Peak {metric_label} was {highest[0]} at {highest[1]:,.2f}, vs {lowest[0]} at {lowest[1]:,.2f} on the low end."
+            )
+        return " ".join(parts)
+
+    label, amount = series[0]
+    if mentions_total:
+        return f"Only {label} matched that request, so the total equals that single period ({amount:,.2f} {metric_label})."
+
+    prompt_period_count = 0
+    if isinstance(context, Mapping):
+        try:
+            prompt_period_count = int(context.get("prompt_period_count") or 0)
+        except (TypeError, ValueError):
+            prompt_period_count = 0
+    if prompt_period_count and prompt_period_count > 1:
+        return (
+            f"I only found one period ({label}) even though multiple months were requested, "
+            f"so totals mirror that month at {amount:,.2f} {metric_label}."
+        )
+    return ""
+
+
+def _build_inventory_field_note(
+    lowered_prompt: str,
+    context_type: str | None,
+    sql_payload: Mapping | None,
+) -> str:
+    intent = (context_type or "").lower()
+    if intent not in {"inventory", "reorder"} or not isinstance(sql_payload, Mapping):
+        return ""
+    insights = sql_payload.get("insights")
+    sample: Mapping | None = None
+    if intent == "inventory" and isinstance(insights, Mapping):
+        sample_candidate = insights.get("sample")
+        if isinstance(sample_candidate, Mapping):
+            sample = sample_candidate
+    if intent == "reorder" and isinstance(insights, Mapping):
+        top_row = insights.get("top_row")
+        if isinstance(top_row, Mapping):
+            sample = top_row
+    if sample is None:
+        data = sql_payload.get("data")
+        if isinstance(data, list) and data:
+            first = data[0]
+            if isinstance(first, Mapping):
+                sample = first
+    if not isinstance(sample, Mapping):
+        return ""
+    avail = _safe_float(sample.get("Avail") or sample.get("QtyAvailable"))
+    on_hand = _safe_float(sample.get("OnHand"))
+    on_order = _safe_float(sample.get("OnOrder"))
+    if avail is None and on_hand is None:
+        return ""
+    mention_avail = any(keyword in lowered_prompt for keyword in AVAILABLE_FIELD_KEYWORDS)
+    mention_on_hand = any(keyword in lowered_prompt for keyword in ON_HAND_FIELD_KEYWORDS)
+    difference = None
+    if avail is not None and on_hand is not None:
+        difference = on_hand - avail
+    highlight = difference is not None and abs(difference) >= 1
+    if not (mention_avail or mention_on_hand or highlight):
+        return ""
+    parts: list[str] = []
+    if on_hand is not None:
+        parts.append(f"On hand shows the physical stock ({on_hand:,.0f} units).")
+    if avail is not None:
+        if difference is not None and difference > 0:
+            parts.append(f"Available backs out {difference:,.0f} allocated units, leaving {avail:,.0f} ready.")
+        else:
+            parts.append(f"Available after allocations is {avail:,.0f} units.")
+    if on_order and on_order > 0:
+        parts.append(f"{on_order:,.0f} more are on purchase orders and not yet available.")
+    return " ".join(parts)
+
+
+def build_business_context_note(prompt: str, context: Mapping | None, sql_payload: Mapping | None) -> str:
+    if not prompt or not isinstance(context, Mapping) or not isinstance(sql_payload, Mapping):
+        return ""
+    lowered = prompt.lower()
+    intent = context.get("intent")
+    insights = sql_payload.get("insights")
+    context_type = sql_payload.get("context_type") or intent
+    parts: list[str] = []
+    metric_note = _build_metric_choice_note(lowered, intent if isinstance(intent, str) else None)
+    if metric_note:
+        parts.append(metric_note)
+    period_note = _build_period_scope_note(lowered, context, insights if isinstance(insights, Mapping) else None)
+    if period_note:
+        parts.append(period_note)
+    inventory_note = _build_inventory_field_note(lowered, context_type if isinstance(context_type, str) else None, sql_payload)
+    if inventory_note:
+        parts.append(inventory_note)
+    return " ".join(part for part in parts if part).strip()
+
+
+def describe_custom_sql_message(insights: dict | None) -> str:
+    if not insights:
+        return "Custom SQL results are ready."
+    parts: list[str] = []
+    summary = insights.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        parts.append(summary.strip())
+    row_count = insights.get("row_count")
+    if isinstance(row_count, int):
+        label = "row" if row_count == 1 else "rows"
+        parts.append(f"Returned {row_count} {label}.")
+    note = insights.get("note")
+    if isinstance(note, str) and note.strip():
+        parts.append(note.strip())
+    return " ".join(parts) if parts else "Custom SQL results are ready."
+
+
+def handle_custom_sql_question(
+    cursor: pyodbc.Cursor, prompt: str, today: datetime.date, context: dict | None = None
+) -> dict:
+    context = context or {}
+    schema = load_allowed_sql_schema(cursor)
+    if not schema:
+        return {
+            "error": "Custom SQL requires schema metadata, but it is unavailable right now.",
+            "data": None,
+            "sql": None,
+            "context_type": CUSTOM_SQL_INTENT,
+        }
+    schema_summary = summarize_schema_for_prompt(schema)
+    context_hint = summarize_sql_context(context)
+    plan = call_openai_sql_generator(prompt, today, schema_summary, context_hint)
+    if not isinstance(plan, dict):
+        return {
+            "error": "I wasn't able to design a custom SQL query for that request. Try rephrasing with more specifics.",
+            "data": None,
+            "sql": None,
+            "context_type": CUSTOM_SQL_INTENT,
+        }
+
+    sql_text = plan.get("sql")
+    valid, reason = validate_custom_sql(sql_text, CUSTOM_SQL_ALLOWED_TABLES)
+    if not valid:
+        return {
+            "error": reason or "The generated SQL was not valid.",
+            "data": None,
+            "sql": sql_text if isinstance(sql_text, str) else None,
+            "context_type": CUSTOM_SQL_INTENT,
+        }
+
+    params = normalize_sql_params(plan.get("params"))
+    sql_preview = format_sql_preview(sql_text, params) if params else (sql_text or "")
+
+    try:
+        cursor.execute(sql_text, params)
+        fetched = cursor.fetchmany(CUSTOM_SQL_MAX_ROWS + 1)
+        columns = [col[0] for col in cursor.description] if cursor.description else []
+    except pyodbc.Error as err:
+        return {
+            "error": f"Custom SQL failed: {err}",
+            "data": None,
+            "sql": sql_preview or sql_text,
+            "context_type": CUSTOM_SQL_INTENT,
+        }
+
+    rows: list[dict] = []
+    limit = min(len(fetched), CUSTOM_SQL_MAX_ROWS)
+    for raw in fetched[:limit]:
+        if columns:
+            rows.append(dict(zip(columns, raw)))
+        else:
+            rows.append({"value": raw})
+    truncated = len(fetched) > CUSTOM_SQL_MAX_ROWS
+    summary_text = plan.get("summary") if isinstance(plan.get("summary"), str) else ""
+    insights = {
+        "summary": summary_text,
+        "row_count": len(rows),
+        "truncated": truncated,
+    }
+    if truncated:
+        insights["note"] = f"Showing first {CUSTOM_SQL_MAX_ROWS} rows."
+    return {
+        "data": rows,
+        "sql": sql_preview or sql_text,
+        "context_type": CUSTOM_SQL_INTENT,
+        "insights": insights,
+    }
 
 
 def compose_conversational_message(
@@ -3039,7 +5517,9 @@ def compose_conversational_message(
         reply_sections.append(llm_reply.strip())
 
     if intent == "chitchat":
-        reply_sections.append(generate_chitchat_reply(prompt, session_history))
+        chitchat_addon = generate_chitchat_reply(prompt, session_history, llm_reply=llm_reply)
+        if chitchat_addon:
+            reply_sections.append(chitchat_addon)
         return "\n\n".join(part for part in reply_sections if part).strip()
 
     if not sql_payload:
@@ -3060,14 +5540,28 @@ def compose_conversational_message(
     insights = sql_payload.get("insights")
     if intent in {"usage", "report"}:
         reply_sections.append(describe_usage_message(insights))
+    elif intent == "sales":
+        reply_sections.append(describe_sales_message(insights))
     elif intent == "inventory":
         reply_sections.append(describe_inventory_message(insights))
+    elif intent == "inventory_usage":
+        reply_sections.append(describe_inventory_usage_message(insights))
+    elif intent == MULTI_ITEM_INTENT:
+        reply_sections.append(describe_multi_item_message(insights))
+    elif intent == ALL_ITEMS_INTENT:
+        reply_sections.append(describe_all_items_message(insights))
     elif intent == "reorder":
         reply_sections.append(describe_reorder_message(insights))
     elif intent == "compare":
         reply_sections.append(describe_compare_message(insights))
     elif intent == "why_drop":
         reply_sections.append(describe_why_drop_message(insights))
+    elif intent == CUSTOM_SQL_INTENT:
+        reply_sections.append(describe_custom_sql_message(insights))
+
+    context_note = build_business_context_note(prompt, context, sql_payload)
+    if context_note:
+        reply_sections.append(context_note)
 
     message = "\n\n".join(part for part in reply_sections if part).strip()
     footer = CORRECTION_PROMPT_FOOTER if intent != "chitchat" else ""
@@ -3112,16 +5606,27 @@ def handle_chat_prompt(
             "context_type": "chitchat",
             "context": context,
         }
+    context["needs_item_for_intent"] = None
 
     sql_payload: dict | None = None
     if intent == "inventory":
         sql_payload = handle_inventory_question(cursor, prompt, context)
+    elif intent == "inventory_usage":
+        sql_payload = handle_inventory_usage_question(cursor, prompt, today, context)
     elif intent == "reorder":
         sql_payload = handle_reorder_question(cursor, prompt, today, context)
     elif intent == "compare":
         sql_payload = handle_compare_question(cursor, prompt, today, context)
     elif intent == "why_drop":
         sql_payload = handle_why_drop_question(cursor, prompt, today, context)
+    elif intent == "sales":
+        sql_payload = handle_sales_question(cursor, prompt, today, context)
+    elif intent == MULTI_ITEM_INTENT:
+        sql_payload = handle_multi_item_question(cursor, prompt, today, context)
+    elif intent == ALL_ITEMS_INTENT:
+        sql_payload = handle_all_items_question(cursor, prompt, today, context)
+    elif intent == CUSTOM_SQL_INTENT:
+        sql_payload = handle_custom_sql_question(cursor, prompt, today, context)
     elif intent in {"usage", "report"}:
         sql_payload = handle_usage_question(cursor, prompt, today, context)
     elif intent != "chitchat":
@@ -3200,9 +5705,11 @@ def render_sql_chat(today: datetime.date, current_user: dict | None = None) -> N
     st.subheader("SQL-style data chat")
     st.caption(
         "Ask plain-language questions about Dynamics GP data. "
-        "I'll classify the intent (report, compare, why_drop, inventory, reorder), pull relevant memory, "
-        "and fill the right SQL template automatically. Mention an item (e.g., NO3CA12), time period, "
-        "and optional math like 'multiply by 3'. Use 'feedback: ...' for persistent guidance or 'reset' to clear the chat."
+        "I'll classify the intent (usage/report, sales, compare, why_drop, inventory, availability-vs-usage, multi-item summaries, all-items overview, reorder) and pull relevant memory, "
+        "then either run the matching template or fall back to a safe custom SQL plan for purchase-order, vendor, or other bespoke questions. "
+        "The custom SQL path is read-only and limited to vetted GP tables so nothing can be modified. "
+        "Mention an item (e.g., NO3CA12), time period, and optional math like 'multiply by 3'. "
+        "Use 'feedback: ...' for persistent guidance or 'reset' to clear the chat."
     )
 
     user_id = get_authenticated_user_id()
@@ -3521,6 +6028,21 @@ WHERE t.ITEMNMBR = ?
   AND h.DOCDATE <= ?;
 """
 
+SALES_QUERY = """
+SELECT SUM(
+           CASE
+               WHEN l.SOPTYPE = 4 THEN -ABS(l.QUANTITY)
+               ELSE ABS(l.QUANTITY)
+           END
+       ) AS SalesQuantity
+FROM SOP30300 l
+JOIN SOP30200 h ON h.SOPTYPE = l.SOPTYPE AND h.SOPNUMBE = l.SOPNUMBE
+WHERE l.ITEMNMBR = ?
+  AND h.DOCDATE >= ?
+  AND h.DOCDATE <= ?
+  AND l.SOPTYPE IN (3, 4);
+"""
+
 USAGE_BY_MONTH_QUERY = """
 SELECT
     DATEFROMPARTS(YEAR(h.DOCDATE), MONTH(h.DOCDATE), 1) AS PeriodStart,
@@ -3554,9 +6076,6 @@ SELECT TOP 25
     (i.ORDRPNTQTY - (i.QTYONHND - i.ATYALLOC)) AS Shortfall
 FROM IV00102 i
 JOIN IV00101 m ON m.ITEMNMBR = i.ITEMNMBR
-WHERE i.LOCNCODE = 'MAIN'
-  AND (i.QTYONHND - i.ATYALLOC) < i.ORDRPNTQTY
-ORDER BY Shortfall DESC;
 """
 
 
@@ -3685,6 +6204,109 @@ def fetch_usage(cursor: pyodbc.Cursor, item_number: str, start_date: datetime.da
     cursor.execute(USAGE_QUERY, item_number, start_date, end_date)
     result = cursor.fetchone()
     return float(result[0]) if result and result[0] is not None else 0.0
+
+
+def fetch_sales(cursor: pyodbc.Cursor, item_number: str, start_date: datetime.date, end_date: datetime.date) -> float:
+    cursor.execute(SALES_QUERY, item_number, start_date, end_date)
+    result = cursor.fetchone()
+    return float(result[0]) if result and result[0] is not None else 0.0
+
+
+def fetch_usage_scope_rows(
+    cursor: pyodbc.Cursor,
+    start_date: datetime.date,
+    end_date: datetime.date,
+    *,
+    limit: int = 40,
+    site_codes: list[str] | None = None,
+    site_covers_all: bool = False,
+    class_filters: list[str] | None = None,
+    class_covers_all: bool = False,
+    item_list: list[str] | None = None,
+    keywords: list[str] | None = None,
+    order_mode: str = "usage",
+) -> tuple[list[dict], str]:
+    site_codes = site_codes or []
+    class_filters = class_filters or []
+    item_list = [code.strip().upper() for code in item_list or [] if code]
+    keywords = keywords or []
+    scoped_limit = max(1, int(limit)) if limit else 40
+    clauses: list[str] = []
+    params: list = [start_date, end_date]
+
+    if site_covers_all:
+        pass
+    elif site_codes:
+        placeholders = ", ".join("?" for _ in site_codes)
+        clauses.append(f"EXISTS (SELECT 1 FROM IV00102 i WHERE i.ITEMNMBR = m.ITEMNMBR AND i.LOCNCODE IN ({placeholders}))")
+        params.extend(site_codes)
+    else:
+        clauses.append("EXISTS (SELECT 1 FROM IV00102 i WHERE i.ITEMNMBR = m.ITEMNMBR AND i.LOCNCODE = ?)")
+        params.append("MAIN")
+
+    if class_filters and not class_covers_all:
+        class_clause = " OR ".join("m.ITMCLSCD LIKE ?" for _ in class_filters)
+        clauses.append(f"({class_clause})")
+        params.extend(_wildcard_value(value) for value in class_filters)
+
+    if item_list:
+        placeholders = ", ".join("?" for _ in item_list)
+        clauses.append(f"m.ITEMNMBR IN ({placeholders})")
+        params.extend(item_list)
+
+    for keyword in keywords:
+        clauses.append("UPPER(m.ITEMDESC) LIKE ?")
+        params.append(f"%{keyword}%")
+
+    clause_sql = ""
+    if clauses:
+        clause_sql = "\n  AND " + "\n  AND ".join(clauses)
+
+    if order_mode == "abs":
+        order_clause = "ORDER BY ABS(COALESCE(u.UsageQty, 0)) ASC, m.ITEMNMBR"
+    elif order_mode == "desc":
+        order_clause = "ORDER BY COALESCE(u.UsageQty, 0) DESC, m.ITEMNMBR"
+    else:
+        order_clause = "ORDER BY COALESCE(u.UsageQty, 0) ASC, m.ITEMNMBR"
+
+    query = f"""
+    WITH UsageTotals AS (
+        SELECT t.ITEMNMBR, SUM(t.TRXQTY) AS UsageQty
+        FROM IV30300 t
+        JOIN IV30200 h ON h.DOCNUMBR = t.DOCNUMBR AND h.IVDOCTYP = t.DOCTYPE
+        WHERE t.DOCTYPE = 1
+          AND t.TRXQTY < 0
+          AND h.DOCDATE BETWEEN ? AND ?
+        GROUP BY t.ITEMNMBR
+    )
+    SELECT TOP {scoped_limit}
+        m.ITEMNMBR,
+        m.ITEMDESC,
+        m.ITMCLSCD,
+        COALESCE(u.UsageQty, 0) AS UsageQty
+    FROM IV00101 m
+    LEFT JOIN UsageTotals u ON u.ITEMNMBR = m.ITEMNMBR
+    WHERE 1=1
+    {clause_sql}
+    {order_clause};
+    """
+    cursor.execute(query, params)
+    fetched = cursor.fetchall()
+    rows: list[dict] = []
+    for row in fetched:
+        item = getattr(row, "ITEMNMBR", None)
+        usage_value = getattr(row, "UsageQty", 0.0) or 0.0
+        rows.append(
+            {
+                "Item": item,
+                "Description": getattr(row, "ITEMDESC", None),
+                "Class": getattr(row, "ITMCLSCD", None),
+                "Usage": float(usage_value),
+                "AbsUsage": abs(float(usage_value)),
+            }
+        )
+    sql_preview = format_sql_preview(query, params)
+    return rows, sql_preview
 
 
 def fetch_monthly_usage(
