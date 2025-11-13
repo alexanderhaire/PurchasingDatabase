@@ -669,23 +669,68 @@ def ensure_training_feedback_dir() -> Path:
     return directory
 
 
-def _json_log_default(value: object) -> object:
+# JSON allows dict keys that are str/int/float/bool/None; anything else must be coerced.
+_JSON_KEY_SAFE_TYPES = (str, int, float, bool, type(None))
+
+
+def _json_log_safe_value(value: object) -> object:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
     if isinstance(value, Decimal):
         return str(value)
+    if isinstance(value, Number):
+        number = float(value)
+        if math.isnan(number) or math.isinf(number):
+            return None
+        return number
+    if isinstance(value, dict):
+        safe_dict: dict = {}
+        for key, child in value.items():
+            if isinstance(key, _JSON_KEY_SAFE_TYPES):
+                safe_key = key
+            else:
+                safe_key = str(key)
+            safe_dict[safe_key] = _json_log_safe_value(child)
+        return safe_dict
+    if isinstance(value, (list, tuple)):
+        return [_json_log_safe_value(child) for child in value]
+    if isinstance(value, set):
+        return [_json_log_safe_value(child) for child in value]
     if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
         return value.isoformat()
     if isinstance(value, Path):
         return str(value)
-    if isinstance(value, set):
-        return list(value)
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    if hasattr(value, "item"):
+        try:
+            return _json_log_safe_value(value.item())
+        except Exception:
+            pass
     return str(value)
+
+
+def _json_log_default(value: object) -> object:
+    return _json_log_safe_value(value)
 
 
 def _append_jsonl(filename: Path, payload: object) -> None:
     with filename.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, default=_json_log_default) + "\n")
+        safe_payload = _json_log_safe_value(payload)
+        handle.write(json.dumps(safe_payload, default=_json_log_default) + "\n")
 
 
 def record_correction(example: dict | None, user_id: str | None = None) -> None:
