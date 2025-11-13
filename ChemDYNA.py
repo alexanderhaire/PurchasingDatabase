@@ -10,7 +10,9 @@ import logging
 import math
 import re
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
+from decimal import Decimal
+from functools import lru_cache
 from numbers import Number
 from pathlib import Path
 from typing import Any, Callable, TypedDict
@@ -45,6 +47,12 @@ CHAT_SESSION_CONTEXT_KEY = "context"
 SEMANTIC_MEMORY_KEY = "sql_chat_memory"
 SEMANTIC_MEMORY_MAX = 200
 SEMANTIC_MEMORY_RESULTS = 3
+LLM_HISTORY_WINDOW = 8  # number of literal turns to keep verbatim
+HISTORY_SUMMARY_LOOKBACK = 24  # max older turns to scan when summarizing
+HISTORY_SUMMARY_MAX_CONTEXT_LINES = 6
+HISTORY_SUMMARY_MAX_SQL_LINES = 6
+HISTORY_SUMMARY_CONTENT_LIMIT = 220
+HISTORY_SUMMARY_SQL_LIMIT = 320
 ITEM_TOKEN_PATTERN = re.compile(r"\b[A-Z0-9]{3,}\b")
 CHAT_ITEM_STOPWORDS = {
     "SHOW",
@@ -106,6 +114,35 @@ CHAT_ITEM_STOPWORDS = {
     "THANK",
     "THANKS",
     "ALSO",
+    "CAN",
+    "CANT",
+    "YOU",
+    "YOURSELF",
+    "TURN",
+    "THIS",
+    "THAT",
+    "THESE",
+    "THOSE",
+    "MAKE",
+    "MAKES",
+    "MAKING",
+    "GRAPH",
+    "GRAPHS",
+    "CHART",
+    "CHARTS",
+    "PLOT",
+    "PLOTS",
+    "DRAW",
+    "DRAWING",
+    "CREATE",
+    "CREATES",
+    "CREATING",
+    "BUILD",
+    "BUILDING",
+    "BUILT",
+    "INTO",
+    "AGAIN",
+    "ANOTHER",
 }
 ITEM_PRECEDING_KEYWORDS = {
     "FOR",
@@ -183,6 +220,29 @@ GRAPH_MULTI_PHRASES: tuple[str, ...] = (
     "make a chart",
     "show a graph",
     "show the graph",
+)
+
+CUSTOM_SQL_CHART_DIMENSION_KEYWORDS: tuple[str, ...] = (
+    "period",
+    "month",
+    "date",
+    "year",
+    "week",
+    "day",
+)
+CUSTOM_SQL_CHART_METRIC_KEYWORDS: tuple[str, ...] = (
+    "total",
+    "amount",
+    "qty",
+    "quantity",
+    "usage",
+    "units",
+    "value",
+    "sales",
+    "revenue",
+    "count",
+    "cost",
+    "sum",
 )
 
 MONTH_KEYWORD_TOKENS = {
@@ -280,6 +340,15 @@ REORDER_SHORTAGE_KEYWORDS: tuple[str, ...] = (
     "need more inventory",
 )
 
+BURN_RATE_KEYWORDS: tuple[str, ...] = (
+    "burn rate",
+    "burn-rate",
+    "burnrate",
+    "burning rate",
+    "usage rate",
+    "consumption rate",
+)
+
 RESET_COMMANDS = {"reset", "clear", "clear chat", "restart"}
 CORRECTION_PREFIXES = ("correction:", "fix:")
 CORRECTION_PROMPT_FOOTER = "If this isn’t what you meant, tell me what to fix (e.g., 'use December too' or 'wrong intent')."
@@ -288,12 +357,15 @@ OPENAI_DEFAULT_MODEL = "gpt-5.0"
 OPENAI_TIMEOUT_SECONDS = 15
 OPENAI_EMBEDDING_URL = "https://api.openai.com/v1/embeddings"
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
+REASONING_PREVIEW_ROWS = 24
+REASONING_VALUE_CHAR_LIMIT = 160
+REASONING_MAX_NESTING = 4
+REASONING_STEP_LIMIT = 6
 TRAINING_FEEDBACK_DIR = APP_ROOT / "training_feedback"
 LOCAL_SECRETS_PATHS = (
     APP_ROOT / ".streamlit" / "secrets.toml",
     APP_ROOT / "secrets.toml",
 )
-_PROJECT_SECRETS_CACHE: dict | None = None
 RECENT_CORRECTION_LIMIT = 5
 CHAT_EVENT_LOG_FILENAME = "chat_events.jsonl"
 SELF_SIGNUP_STORE_PATH = APP_ROOT / ".streamlit" / "self_signup_users.json"
@@ -320,6 +392,8 @@ CUSTOM_SQL_ALLOWED_TABLES: tuple[str, ...] = (
     "IV00102",
     "IV30200",
     "IV30300",
+    "BM00101",
+    "BM00111",
     "POP10100",
     "POP10110",
     "POP30100",
@@ -331,6 +405,10 @@ CUSTOM_SQL_ALLOWED_TABLES: tuple[str, ...] = (
     "SOP10200",
     "SOP30200",
     "SOP30300",
+)
+CUSTOM_SQL_HINTS: tuple[str, ...] = (
+    "Inventory adjustments: IV30300 transaction detail holds TRXQTY but not DOCDATE; join IV30200 header (DOCNUMBR + DOCTYPE) to filter by DOCDATE or other header fields.",
+    "Sales shipments: SOP30300 line detail holds QUANTITY/EXTDCOST but not DOCDATE; join SOP30200 header (SOPNUMBE + SOPTYPE) whenever you need DOCDATE or posting metadata.",
 )
 SQL_SCHEMA_CACHE_KEY = "default"
 SQL_SCHEMA_CACHE: dict[str, dict[str, list[dict]]] = {}
@@ -398,17 +476,14 @@ def get_authenticated_user_id() -> str | None:
 LOGGER = logging.getLogger(__name__)
 
 
+@lru_cache(maxsize=1)
 def load_project_secrets() -> dict:
     """
     Return secrets parsed from a local secrets.toml when Streamlit secrets are unavailable.
     """
 
-    global _PROJECT_SECRETS_CACHE
-    if _PROJECT_SECRETS_CACHE is not None:
-        return _PROJECT_SECRETS_CACHE
     if tomllib is None:
-        _PROJECT_SECRETS_CACHE = {}
-        return _PROJECT_SECRETS_CACHE
+        return {}
     for candidate in LOCAL_SECRETS_PATHS:
         try:
             with candidate.open("rb") as handle:
@@ -419,16 +494,13 @@ def load_project_secrets() -> dict:
             LOGGER.warning("Unable to read secrets file %s: %s", candidate, err)
             continue
         if isinstance(parsed, Mapping):
-            _PROJECT_SECRETS_CACHE = dict(parsed)
-        else:
-            try:
-                _PROJECT_SECRETS_CACHE = {key: parsed[key] for key in parsed}
-            except Exception as err:  # pragma: no cover - defensive guard.
-                LOGGER.warning("Unexpected secrets structure in %s: %s", candidate, err)
-                _PROJECT_SECRETS_CACHE = {}
-        return _PROJECT_SECRETS_CACHE
-    _PROJECT_SECRETS_CACHE = {}
-    return _PROJECT_SECRETS_CACHE
+            return dict(parsed)
+        try:
+            return {key: parsed[key] for key in parsed}
+        except (KeyError, TypeError, AttributeError) as err:  # pragma: no cover - defensive guard.
+            LOGGER.warning("Unexpected secrets structure in %s: %s", candidate, err)
+            return {}
+    return {}
 
 
 def ensure_semantic_memory() -> list[dict]:
@@ -582,6 +654,12 @@ def record_memory_entry(
         "context_type": response_payload.get("context_type"),
         "entities": context.get("entities"),
     }
+    insights = context.get("insights")
+    if isinstance(insights, dict) and insights:
+        metadata["insights"] = insights
+    row_aggregates = context.get("row_aggregates")
+    if isinstance(row_aggregates, dict) and row_aggregates:
+        metadata["row_aggregates"] = row_aggregates
     store_semantic_memory("\n".join(parts), metadata)
 
 
@@ -589,6 +667,25 @@ def ensure_training_feedback_dir() -> Path:
     directory = TRAINING_FEEDBACK_DIR
     directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def _json_log_default(value: object) -> object:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, set):
+        return list(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _append_jsonl(filename: Path, payload: object) -> None:
+    with filename.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, default=_json_log_default) + "\n")
 
 
 def record_correction(example: dict | None, user_id: str | None = None) -> None:
@@ -601,8 +698,7 @@ def record_correction(example: dict | None, user_id: str | None = None) -> None:
         payload.setdefault("user_id", user_id)
     payload.setdefault("timestamp", datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"))
     try:
-        with filename.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload) + "\n")
+        _append_jsonl(filename, payload)
     except OSError as err:
         LOGGER.warning("Failed to record correction: %s", err)
 
@@ -619,8 +715,7 @@ def log_chat_event(event: dict | None) -> None:
     payload = event.copy()
     payload.setdefault("timestamp", datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"))
     try:
-        with filename.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload) + "\n")
+        _append_jsonl(filename, payload)
     except OSError as err:
         LOGGER.warning("Failed to log chat event: %s", err)
 
@@ -791,6 +886,112 @@ def find_prior_user_prompt(history: list[dict], anchor_id: str | None) -> str | 
     return None
 
 
+def _shorten_history_text(value: str | None, limit: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = " ".join(value.strip().split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 3].rstrip() + "..."
+
+
+def _summarize_sql_snippet(entry: dict) -> str | None:
+    sql_text = entry.get("sql")
+    if not isinstance(sql_text, str) or not sql_text.strip():
+        return None
+    normalized_sql = " ".join(sql_text.split())
+    sql_summary = _shorten_history_text(normalized_sql, HISTORY_SUMMARY_SQL_LIMIT)
+    context = entry.get("context") if isinstance(entry.get("context"), dict) else {}
+    context_label_parts: list[str] = []
+    intent = context.get("intent")
+    if isinstance(intent, str):
+        context_label_parts.append(intent)
+    entities = context.get("entities") if isinstance(context.get("entities"), dict) else {}
+    item = context.get("item") or entities.get("item")
+    if isinstance(item, str):
+        context_label_parts.append(item)
+    month = context.get("month")
+    year = context.get("year")
+    if isinstance(month, int) and isinstance(year, int) and 1 <= month <= 12:
+        context_label_parts.append(f"{calendar.month_abbr[month]} {year}")
+    context_label = " ".join(part for part in context_label_parts if part)
+    if context_label:
+        return f"{context_label}: {sql_summary}"
+    return sql_summary
+
+
+def _summarize_conversation_line(entry: dict) -> str | None:
+    role = entry.get("role")
+    if role not in {"user", "assistant"}:
+        return None
+    snippet = _shorten_history_text(entry.get("content"), HISTORY_SUMMARY_CONTENT_LIMIT)
+    if not snippet:
+        return None
+    role_label = "User" if role == "user" else "Assistant"
+    return f"{role_label}: {snippet}"
+
+
+def summarize_older_history_entries(history: list[dict], window: int | None = None) -> dict | None:
+    if window is None:
+        window = LLM_HISTORY_WINDOW
+    if not history or len(history) <= window:
+        return None
+    older_entries = history[:-window]
+    if len(older_entries) > HISTORY_SUMMARY_LOOKBACK:
+        older_entries = older_entries[-HISTORY_SUMMARY_LOOKBACK:]
+    conversation_lines: list[str] = []
+    sql_lines: list[str] = []
+    for entry in older_entries:
+        convo_line = _summarize_conversation_line(entry)
+        if convo_line:
+            conversation_lines.append(convo_line)
+        sql_line = _summarize_sql_snippet(entry)
+        if sql_line:
+            sql_lines.append(sql_line)
+    summary_parts: list[str] = []
+    if conversation_lines:
+        summary_parts.append(
+            "Older conversation recap:\n"
+            + "\n".join(f"- {line}" for line in conversation_lines[-HISTORY_SUMMARY_MAX_CONTEXT_LINES:])
+        )
+    if sql_lines:
+        summary_parts.append(
+            "Earlier SQL outputs to reuse if helpful:\n"
+            + "\n".join(f"- {line}" for line in sql_lines[-HISTORY_SUMMARY_MAX_SQL_LINES:])
+        )
+    if not summary_parts:
+        return None
+    summary_text = (
+        f"Context older than the most recent {window} turns has been condensed below.\n"
+        + "\n\n".join(summary_parts)
+    )
+    return {"role": "system", "content": summary_text}
+
+
+def build_history_messages_for_llm(history: list[dict], window: int | None = None) -> list[dict]:
+    if window is None:
+        window = LLM_HISTORY_WINDOW
+    if not history:
+        return []
+    summary_entry = summarize_older_history_entries(history, window)
+    recent_entries: list[dict] = []
+    for entry in history[-window:]:
+        role = entry.get("role")
+        content = entry.get("content")
+        if role in {"user", "assistant", "system"} and isinstance(content, str):
+            combined_content = content
+            if role == "assistant":
+                snapshot = entry.get("llm_data_snapshot")
+                if isinstance(snapshot, str):
+                    snapshot_text = snapshot.strip()
+                    if snapshot_text:
+                        combined_content = f"{combined_content}\n\n[Data Snapshot]\n{snapshot_text}"
+            recent_entries.append({"role": role, "content": combined_content})
+    if summary_entry:
+        return [summary_entry, *recent_entries]
+    return recent_entries
+
+
 def load_sql_secrets() -> dict:
     """
     Return the SQL section from Streamlit secrets, or {} when not provided.
@@ -848,9 +1049,16 @@ def load_openai_settings() -> dict:
 
     model = openai_section.get("model", OPENAI_DEFAULT_MODEL)
     sql_model = openai_section.get("sql_model") or openai_section.get("query_model")
+    reasoning_model = (
+        openai_section.get("reasoning_model")
+        or openai_section.get("analysis_model")
+        or openai_section.get("insight_model")
+    )
     settings = {"api_key": api_key, "model": model}
     if sql_model:
         settings["sql_model"] = sql_model
+    if reasoning_model:
+        settings["reasoning_model"] = reasoning_model
     return settings
 
 
@@ -1812,6 +2020,122 @@ def update_session_context(session_context: dict, context: dict | None) -> None:
     if isinstance(entities, dict) and entities:
         session_context.setdefault("entities", {})
         session_context["entities"].update(entities)
+    if "insights" in context:
+        insights_value = context.get("insights")
+        if isinstance(insights_value, Mapping) and insights_value:
+            session_context["insights"] = insights_value
+        else:
+            session_context.pop("insights", None)
+    if "row_aggregates" in context:
+        aggregate_value = context.get("row_aggregates")
+        if isinstance(aggregate_value, Mapping) and aggregate_value:
+            session_context["row_aggregates"] = aggregate_value
+        else:
+            session_context.pop("row_aggregates", None)
+
+
+SESSION_CONTEXT_SANITIZE_DEPTH = 3
+SESSION_CONTEXT_MAX_COLLECTION_ITEMS = 10
+SESSION_CONTEXT_MAX_MAPPING_ITEMS = 20
+SESSION_CONTEXT_SAMPLE_ROWS = 5
+SESSION_CONTEXT_NUMERIC_TOTAL_LIMIT = 6
+
+
+def _coerce_real_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, Number):
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if math.isnan(number) or math.isinf(number):
+            return None
+        return number
+    return None
+
+
+def _sanitize_session_value(value: Any, depth: int = SESSION_CONTEXT_SANITIZE_DEPTH) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, Number):
+        number = _coerce_real_number(value)
+        if number is None:
+            return None
+        if number.is_integer():
+            return int(number)
+        return number
+    if isinstance(value, datetime.datetime):
+        return value.isoformat(timespec="seconds")
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if depth <= 0:
+        return str(value)
+    if isinstance(value, Mapping):
+        cleaned: dict[str, Any] = {}
+        for idx, (key, entry) in enumerate(value.items()):
+            if idx >= SESSION_CONTEXT_MAX_MAPPING_ITEMS:
+                break
+            sanitized = _sanitize_session_value(entry, depth - 1)
+            if sanitized is not None:
+                cleaned[str(key)] = sanitized
+        return cleaned
+    if isinstance(value, Iterable) and not isinstance(value, (str, bytes, bytearray)):
+        cleaned_list: list[Any] = []
+        for idx, entry in enumerate(value):
+            if idx >= SESSION_CONTEXT_MAX_COLLECTION_ITEMS:
+                break
+            sanitized = _sanitize_session_value(entry, depth - 1)
+            if sanitized is not None:
+                cleaned_list.append(sanitized)
+        return cleaned_list
+    return str(value)
+
+
+def sanitize_insights_for_session(insights: Mapping | None) -> dict | None:
+    if not isinstance(insights, Mapping):
+        return None
+    cleaned = _sanitize_session_value(insights)
+    if isinstance(cleaned, dict) and cleaned:
+        return cleaned
+    return None
+
+
+def build_row_aggregates(rows: Sequence[Mapping] | None) -> dict | None:
+    if rows is None or isinstance(rows, (str, bytes, bytearray)):
+        return None
+    if not isinstance(rows, Sequence):
+        if isinstance(rows, Iterable):
+            rows = list(rows)
+        else:
+            return None
+    row_list = [row for row in rows if isinstance(row, Mapping)]
+    row_count = len(rows)
+    summary: dict[str, Any] = {"row_count": row_count}
+    numeric_totals: dict[str, float] = {}
+    for row in row_list:
+        for key, value in row.items():
+            number = _coerce_real_number(value)
+            if number is None:
+                continue
+            numeric_totals[key] = numeric_totals.get(key, 0.0) + number
+    if numeric_totals:
+        sorted_totals = sorted(numeric_totals.items(), key=lambda pair: abs(pair[1]), reverse=True)
+        summary["numeric_totals"] = {
+            key: value for key, value in sorted_totals[:SESSION_CONTEXT_NUMERIC_TOTAL_LIMIT]
+        }
+    samples: list[dict] = []
+    for row in row_list[:SESSION_CONTEXT_SAMPLE_ROWS]:
+        sanitized = _sanitize_session_value(row)
+        if isinstance(sanitized, dict) and sanitized:
+            samples.append(sanitized)
+    if samples:
+        summary["sample_rows"] = samples
+    if summary.get("row_count") is None and not summary.get("numeric_totals") and not summary.get("sample_rows"):
+        return None
+    return summary
 
 
 def month_key(month: int, year: int) -> str:
@@ -2197,6 +2521,14 @@ def format_item_suggestions(suggestions: list[dict]) -> str:
     return "Did you mean: " + ", ".join(formatted) + "?"
 
 
+def contains_word_boundary_keyword(text: str, keywords: Iterable[str]) -> bool:
+    """Return True if text includes any keyword as an isolated word or phrase."""
+    for keyword in keywords:
+        if re.search(rf"\b{re.escape(keyword)}\b", text):
+            return True
+    return False
+
+
 def looks_like_reorder_prompt(prompt: str, lowered: str | None = None) -> bool:
     haystack = lowered if lowered is not None else prompt.lower()
     if any(keyword in haystack for keyword in REORDER_ACTION_KEYWORDS):
@@ -2237,7 +2569,7 @@ def classify_chat_intent(prompt: str) -> str:
     if looks_like_reorder_prompt(prompt, lowered):
         return "reorder"
     explanation_keywords = ("mean", "explain", "why", "how", "what does", "difference", "clarify", "tell me more")
-    if any(keyword in lowered for keyword in explanation_keywords):
+    if contains_word_boundary_keyword(lowered, explanation_keywords):
         return "chitchat"
 
     has_item_code = bool(extract_item_code(prompt))
@@ -2296,7 +2628,7 @@ DATA_REQUEST_KEYWORDS: tuple[str, ...] = (
     "demand",
     "forecast",
     "how much",
-)
+) + BURN_RATE_KEYWORDS
 
 USAGE_HISTORY_KEYWORDS: tuple[str, ...] = (
     "usage",
@@ -2322,7 +2654,7 @@ USAGE_HISTORY_KEYWORDS: tuple[str, ...] = (
     "invoiced sales",
     "shipped",
     "shipments",
-)
+) + BURN_RATE_KEYWORDS
 
 INVENTORY_INTENT_KEYWORDS: tuple[str, ...] = (
     "inventory",
@@ -2350,7 +2682,7 @@ USAGE_INTENT_KEYWORDS: tuple[str, ...] = (
     "summary",
     "use",
     "using",
-)
+) + BURN_RATE_KEYWORDS
 
 USAGE_METRIC_KEYWORDS: tuple[str, ...] = (
     "usage",
@@ -2359,7 +2691,7 @@ USAGE_METRIC_KEYWORDS: tuple[str, ...] = (
     "consume",
     "consumed",
     "consumption",
-)
+) + BURN_RATE_KEYWORDS
 
 SALES_INTENT_KEYWORDS: tuple[str, ...] = (
     "sale",
@@ -2377,6 +2709,24 @@ SALES_INTENT_KEYWORDS: tuple[str, ...] = (
     "customer orders",
     "customer shipment",
     "customer shipments",
+)
+
+BOM_PROMPT_KEYWORDS: tuple[str, ...] = (
+    "bill of materials",
+    "bill-of-materials",
+    "bom",
+    "bom explosion",
+    "component list",
+    "components of",
+    "parts list",
+    "what goes into",
+    "what go into",
+    "goes into",
+    "go into",
+    "made of",
+    "made up of",
+    "ingredients for",
+    "ingredients in",
 )
 
 MULTI_ITEM_SCOPE_KEYWORDS: tuple[str, ...] = (
@@ -2643,6 +2993,11 @@ def contains_sales_intent(prompt: str) -> bool:
 def contains_usage_intent(prompt: str) -> bool:
     lowered = prompt.lower()
     return any(keyword in lowered for keyword in USAGE_INTENT_KEYWORDS)
+
+
+def looks_like_bom_prompt(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return any(keyword in lowered for keyword in BOM_PROMPT_KEYWORDS)
 
 
 def contains_compare_language(prompt: str) -> bool:
@@ -2990,8 +3345,36 @@ def contains_this_year_reference(prompt: str) -> bool:
 
 
 def mentions_month_range(prompt: str) -> bool:
+    if not prompt:
+        return False
+
     lowered = prompt.lower()
-    return any(keyword in lowered for keyword in RANGE_KEYWORDS)
+    current_year = datetime.date.today().year
+    month_mentions = extract_periods_from_prompt(prompt, current_year)
+    month_count = len(month_mentions)
+    year_mentions = extract_year_mentions(prompt)
+    year_count = len(year_mentions)
+
+    def has_multiple_time_refs() -> bool:
+        if month_count >= 2:
+            return True
+        if month_count >= 1 and year_count >= 1:
+            return True
+        if year_count >= 2:
+            return True
+        return False
+
+    if not has_multiple_time_refs():
+        return False
+
+    core_range_keywords = ("between", "range", "through", "thru", "span")
+    if any(keyword in lowered for keyword in core_range_keywords):
+        return True
+
+    if "from" in lowered:
+        return bool(re.search(r"\bfrom\b.*?(?:\bto\b|\bthrough\b|\bthru\b|-)", lowered))
+
+    return False
 
 
 def describe_month_year(month: int | None, year: int | None, fallback_year: int) -> str:
@@ -3065,10 +3448,114 @@ FOLLOWUP_DATA_PHRASES: tuple[str, ...] = (
     "same table",
 )
 
+THAT_VISUAL_WINDOW = 3
+
+
+def _mentions_that_visualization(prompt: str, window: int = THAT_VISUAL_WINDOW) -> bool:
+    tokens = re.findall(r"[a-z]+", prompt.lower())
+    if not tokens or "that" not in tokens:
+        return False
+    for idx, token in enumerate(tokens):
+        if token != "that":
+            continue
+        start = max(0, idx - window)
+        end = min(len(tokens), idx + window + 1)
+        for neighbor_index in range(start, end):
+            if neighbor_index == idx:
+                continue
+            if tokens[neighbor_index] in GRAPH_SINGLE_TOKENS:
+                return True
+    return False
+
 
 def references_previous_data(prompt: str) -> bool:
     lowered = prompt.lower()
-    return any(phrase in lowered for phrase in FOLLOWUP_DATA_PHRASES)
+    if any(phrase in lowered for phrase in FOLLOWUP_DATA_PHRASES):
+        return True
+    return _mentions_that_visualization(prompt)
+
+
+def _format_metric_snippet(field: str, value: Any) -> str | None:
+    number = _coerce_real_number(value)
+    if number is None:
+        return None
+    lower_field = (field or "").lower()
+    if "percent" in lower_field or lower_field.endswith("_pct"):
+        pct_value = number * 100 if abs(number) <= 1 else number
+        return f"{pct_value:+.1f}%"
+    if float(number).is_integer():
+        return f"{int(round(number)):,}"
+    if abs(number) >= 10:
+        return f"{number:,.1f}"
+    return f"{number:,.2f}"
+
+
+def summarize_insight_metrics(insights: Mapping | None, limit: int = 3) -> list[str]:
+    if not isinstance(insights, Mapping):
+        return []
+    summaries: list[str] = []
+    seen: set[str] = set()
+
+    def add_field(field_name: str | None) -> None:
+        if not field_name or field_name in seen:
+            return
+        snippet = _format_metric_snippet(field_name, insights.get(field_name))
+        if snippet:
+            summaries.append(f"{field_name}={snippet}")
+            seen.add(field_name)
+
+    metric_key = insights.get("metric_key")
+    if isinstance(metric_key, str):
+        add_field(metric_key)
+    total_key = insights.get("total_metric_key")
+    if isinstance(total_key, str):
+        add_field(total_key)
+
+    priority_fields = (
+        "usage",
+        "sales",
+        "row_count",
+        "zero_item_count",
+        "active_item_count",
+        "difference",
+        "percent_change",
+        "drop_amount",
+        "drop_percent",
+        "coverage_months",
+        "multiplier",
+        "scaled",
+    )
+    for field in priority_fields:
+        add_field(field)
+        if len(summaries) >= limit:
+            break
+
+    if len(summaries) < limit:
+        for field in insights:
+            add_field(str(field))
+            if len(summaries) >= limit:
+                break
+
+    return summaries[:limit]
+
+
+def summarize_row_aggregate_snapshot(aggregate: Mapping | None, limit: int = 3) -> list[str]:
+    if not isinstance(aggregate, Mapping):
+        return []
+    parts: list[str] = []
+    row_count = aggregate.get("row_count")
+    row_snippet = _format_metric_snippet("rows", row_count)
+    if row_snippet:
+        parts.append(f"rows={row_snippet}")
+    numeric_totals = aggregate.get("numeric_totals")
+    if isinstance(numeric_totals, Mapping):
+        for key, value in numeric_totals.items():
+            snippet = _format_metric_snippet(key, value)
+            if snippet:
+                parts.append(f"{key}_sum={snippet}")
+            if len(parts) >= limit:
+                break
+    return parts[:limit]
 
 
 def summarize_session_context(session_context: dict | None, today: datetime.date) -> str:
@@ -3116,6 +3603,13 @@ def summarize_session_context(session_context: dict | None, today: datetime.date
         if extra_bits:
             pieces.append("entities[" + "; ".join(extra_bits) + "]")
 
+    insight_bits = summarize_insight_metrics(session_context.get("insights"))
+    if insight_bits:
+        pieces.append("insights[" + "; ".join(insight_bits) + "]")
+    aggregate_bits = summarize_row_aggregate_snapshot(session_context.get("row_aggregates"))
+    if aggregate_bits:
+        pieces.append("rows[" + "; ".join(aggregate_bits) + "]")
+
     return "; ".join(pieces)
 
 
@@ -3142,6 +3636,7 @@ def build_clarification_question(intent: str, context: dict, today: datetime.dat
         return None
 
     prompt_has_item = bool(context.get("prompt_has_item"))
+    followup_same_data = bool(context.get("followup_same_data"))
     entities = context.get("entities") or {}
     candidate_item = context.get("item") or entities.get("item")
     inventory_filter_present = intent == "inventory" and bool(context.get("inventory_filter"))
@@ -3170,10 +3665,11 @@ def build_clarification_question(intent: str, context: dict, today: datetime.dat
         context["needs_item_for_intent"] = intent
         return f"I'm not sure which item you mean. Before I run that {action}, which item number should I use?"
     if not prompt_has_item and candidate_item and not inventory_filter_present:
-        return (
-            f"I'm not sure if you're still asking about {candidate_item}. "
-            f"Should I keep using it for this {action}, or is there another item you have in mind?"
-        )
+        if not followup_same_data:
+            return (
+                f"I'm not sure if you're still asking about {candidate_item}. "
+                f"Should I keep using it for this {action}, or is there another item you have in mind?"
+            )
 
     period_intents = {"usage", "report", "sales", "compare", MULTI_ITEM_INTENT, ALL_ITEMS_INTENT}
     if intent not in period_intents:
@@ -3453,6 +3949,9 @@ def call_openai_sql_generator(
     ]
     if schema_summary:
         user_sections.append("Schema reference:\n" + schema_summary)
+    if CUSTOM_SQL_HINTS:
+        hint_lines = "\n".join(f"- {hint}" for hint in CUSTOM_SQL_HINTS)
+        user_sections.append("Dynamics GP modeling tips:\n" + hint_lines)
     if context_hint:
         user_sections.append(f"Structured context: {context_hint}")
     user_sections.append("User question:\n" + prompt.strip())
@@ -3497,6 +3996,155 @@ def _extract_json_block(text: str) -> str:
     return cleaned
 
 
+def _truncate_reasoner_text(value: str) -> str:
+    trimmed = value.strip()
+    if len(trimmed) <= REASONING_VALUE_CHAR_LIMIT:
+        return trimmed
+    return trimmed[: REASONING_VALUE_CHAR_LIMIT - 3].rstrip() + "..."
+
+
+def _reasoner_safe_value(value, depth: int = 0):
+    if value is None or depth > REASONING_MAX_NESTING:
+        return None
+    if isinstance(value, Mapping):
+        safe: dict[str, object] = {}
+        for key, inner in value.items():
+            safe_inner = _reasoner_safe_value(inner, depth + 1)
+            if safe_inner is not None:
+                safe[str(key)] = safe_inner
+        return safe or None
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        safe_items: list[object] = []
+        for index, inner in enumerate(value):
+            if index >= REASONING_PREVIEW_ROWS:
+                break
+            safe_inner = _reasoner_safe_value(inner, depth + 1)
+            if safe_inner is not None:
+                safe_items.append(safe_inner)
+        return safe_items or None
+    coerced = _coerce_snapshot_value(value)
+    if isinstance(coerced, str):
+        trimmed = coerced.strip()
+        if not trimmed:
+            return None
+        return _truncate_reasoner_text(trimmed)
+    return coerced
+
+
+def _reasoner_preview_rows(rows: object) -> list[object]:
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
+        return []
+    preview: list[object] = []
+    for row in rows:
+        if len(preview) >= REASONING_PREVIEW_ROWS:
+            break
+        safe_row = _reasoner_safe_value(row)
+        if safe_row is not None:
+            preview.append(safe_row)
+    return preview
+
+
+def call_openai_reasoner(
+    prompt: str,
+    today: datetime.date,
+    context: Mapping | None,
+    sql_payload: Mapping | None,
+) -> dict | None:
+    if not sql_payload:
+        return None
+    settings = load_openai_settings()
+    api_key = settings.get("api_key") if settings else None
+    if not api_key:
+        return None
+    data_preview = _reasoner_preview_rows(sql_payload.get("data"))
+    insights_snapshot = _reasoner_safe_value(sql_payload.get("insights"))
+    row_snapshot = _reasoner_safe_value((context or {}).get("row_aggregates"))
+    if not any([data_preview, insights_snapshot, row_snapshot]):
+        return None
+    entity_snapshot = _reasoner_safe_value((context or {}).get("entities"))
+    question_text = prompt.strip() if isinstance(prompt, str) else ""
+    reasoner_payload = {
+        "question": question_text,
+        "intent": (context or {}).get("intent"),
+        "item": (context or {}).get("item"),
+        "notes": (context or {}).get("notes"),
+        "entities": entity_snapshot,
+        "insights": insights_snapshot,
+        "row_aggregates": row_snapshot,
+        "data_preview": data_preview,
+        "sql": sql_payload.get("sql"),
+        "chart_caption": sql_payload.get("chart_caption"),
+        "chart_warning": sql_payload.get("chart_warning"),
+        "today": today.isoformat(),
+    }
+    structured_blob = _snapshot_json(reasoner_payload)
+    model = settings.get("reasoning_model") or settings.get("model", OPENAI_DEFAULT_MODEL)
+    system_prompt = (
+        "You are an expert supply-planning analyst. "
+        "Use the provided SQL findings to think through the problem in multiple steps before responding. "
+        "Cite the evidence in each step and keep conclusions grounded in the supplied data."
+    )
+    user_prompt = (
+        "Original user question:\n"
+        f"{question_text}\n\n"
+        "Structured findings:\n"
+        f"{structured_blob}\n\n"
+        "Return JSON with keys: steps (array), conclusion (string), confidence (string)."
+    )
+    payload = {
+        "model": model,
+        "temperature": 0.1,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        response = requests.post(
+            OPENAI_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=OPENAI_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        json_text = _extract_json_block(content)
+        parsed = json.loads(json_text)
+    except (requests.RequestException, KeyError, json.JSONDecodeError) as err:
+        LOGGER.warning("OpenAI reasoning failed: %s", err)
+        return None
+    result: dict[str, object] = {}
+    steps_value = parsed.get("steps")
+    if isinstance(steps_value, Sequence) and not isinstance(steps_value, (str, bytes, bytearray)):
+        clean_steps: list[str] = []
+        for idx, step in enumerate(steps_value[:REASONING_STEP_LIMIT]):
+            if isinstance(step, str):
+                step_text = step.strip()
+            else:
+                step_text = str(step).strip()
+            if step_text:
+                clean_steps.append(step_text)
+        if clean_steps:
+            result["steps"] = clean_steps
+    conclusion = parsed.get("conclusion")
+    if isinstance(conclusion, str):
+        conclusion_text = conclusion.strip()
+        if conclusion_text:
+            result["conclusion"] = conclusion_text
+    confidence = parsed.get("confidence")
+    if isinstance(confidence, str):
+        confidence_text = confidence.strip()
+        if confidence_text:
+            result["confidence"] = confidence_text
+    return result or None
+
+
 def call_openai_interpreter(
     prompt: str,
     today: datetime.date,
@@ -3534,6 +4182,8 @@ def call_openai_interpreter(
         "If the user asks what to buy or restock, choose intent 'reorder'. "
         "If they ask for items/classes without naming a specific item (e.g., 'which items had no usage' or 'show the emulsifier class'), prefer 'all_items' or 'multi_report' as appropriate and leave item null. "
         "If they omit the item, leave item null and explain assumptions in notes. "
+        "Treat any mention of burn rate (burn-rate, burnrate, usage rate, consumption rate) as a usage/report intent: highlight the historical consumption window and include the per-period average so downstream tools can reuse that burn rate. "
+        "When the user pivots from burn rate or usage questions into 'how much should we buy', stay on intent 'reorder' so the SQL agent compares order-point gaps versus the recent burn rate coverage. "
         "Honor any Relevant past context that appears before the latest input. "
         "Data entities you can reference: "
         "InventoryBalance from IV00102 joined to IV00101 with columns ITEMNMBR, ITEMDESC, ITMCLSCD, QTYONHND, ATYALLOC, QTYONORD, ORDRPNTQTY, and computed QtyAvailable (location MAIN by default unless the user specifies sites). "
@@ -3549,7 +4199,7 @@ def call_openai_interpreter(
     for entry in history or []:
         role = entry.get("role")
         content = entry.get("content")
-        if role in {"user", "assistant"} and isinstance(content, str):
+        if role in {"user", "assistant", "system"} and isinstance(content, str):
             history_messages.append({"role": role, "content": content})
 
     context_text = ""
@@ -3710,6 +4360,8 @@ def interpret_prompt(
             baseline_intent = multi_scope_intent
             context["intent"] = multi_scope_intent
     context["prompt_has_item"] = prompt_item_present
+    if context["followup_same_data"] and context.get("item"):
+        context["prompt_has_item"] = True
     context["prompt_item_candidates"] = extract_item_candidates(prompt)
     period_limit = GRAPH_MAX_USAGE_PERIODS if graph_requested else MAX_USAGE_PERIODS
     raw_periods = extract_periods_from_prompt(prompt, today.year)
@@ -3737,9 +4389,13 @@ def interpret_prompt(
         context["followup_same_data"] = True
 
     followup_same_data = bool(context["followup_same_data"])
-    if prior_session_intent in {"usage", "report", "sales"} and followup_same_data:
-        baseline_intent = prior_session_intent
-        context["intent"] = prior_session_intent
+    if followup_same_data:
+        if prior_session_intent in {"usage", "report", "sales"}:
+            baseline_intent = prior_session_intent
+            context["intent"] = prior_session_intent
+        elif graph_requested and prior_session_intent and prior_session_intent != "chitchat":
+            baseline_intent = prior_session_intent
+            context["intent"] = prior_session_intent
 
     allow_item_inheritance = not (
         context.get("intent") == "reorder"
@@ -3754,6 +4410,8 @@ def interpret_prompt(
         elif not prompt_item_present:
             context["item"] = None
         context["month"] = context.get("month") or session_context.get("month")
+        if followup_same_data and context.get("item"):
+            context["prompt_has_item"] = True
         context["year"] = context.get("year") or session_context.get("year")
         if isinstance(session_context.get("entities"), dict):
             context["entities"].update(session_context["entities"])
@@ -3838,6 +4496,8 @@ def interpret_prompt(
         context["intent"] = "inventory_usage"
     if context.get("item"):
         context["needs_item_for_intent"] = None
+        if followup_same_data:
+            context["prompt_has_item"] = True
 
     inventory_filter = detect_inventory_filter(prompt, context)
     if inventory_filter:
@@ -3922,7 +4582,7 @@ def generate_chitchat_reply(prompt: str, history: list[dict], llm_reply: str | N
         return concept_definition
 
     explanation_triggers = ("explain", "clarify", "mean", "difference", "why", "how", "what does", "tell me more")
-    needs_explanation = any(word in lowered for word in explanation_triggers)
+    needs_explanation = contains_word_boundary_keyword(lowered, explanation_triggers)
     explanation_contexts = (
         "reorder",
         "inventory",
@@ -4093,6 +4753,7 @@ def build_item_metric_report(
         )
         metric_for_period = total_value if len(period_details) > 1 else period_details[0].get(insight_key, 0.0)
 
+    period_count = len(period_details)
     insights = {
         "item": item_code,
         "period": period_label,
@@ -4101,7 +4762,7 @@ def build_item_metric_report(
         total_key: total_value if len(period_details) > 1 else None,
         "metric_key": insight_key,
         "total_metric_key": total_key,
-        "period_count": len(period_details),
+        "period_count": period_count,
         "multiplier": multiplier,
         "scaled": scaled_value,
         "description": item_description,
@@ -4109,6 +4770,12 @@ def build_item_metric_report(
     }
     if assumption_note:
         insights["assumption_note"] = assumption_note
+
+    if period_count:
+        average_value = total_value / period_count
+        insights["average_per_period"] = average_value
+        if insight_key == "usage":
+            insights["burn_rate"] = average_value
 
     if graph_requested:
         chart_points: list[dict] = []
@@ -4920,6 +5587,9 @@ def handle_reorder_question(
             except (TypeError, ValueError):
                 trailing_months = None
 
+    if trailing_months is None and item_code:
+        trailing_months = DEFAULT_USAGE_HISTORY_MONTHS
+
     usage_details = None
     if (
         item_code
@@ -4969,6 +5639,7 @@ def handle_reorder_question(
             "average": avg_usage,
             "cover_need": cover_need,
             "recommended_buy": recommended_buy,
+            "burn_rate": avg_usage,
         }
         insights["usage_based_recommendation"] = usage_details
 
@@ -5023,6 +5694,36 @@ def describe_usage_message(insights: dict | None) -> str:
             )
         elif isinstance(usage_value, (int, float)):
             message_parts.append(f"Usage for the requested period: {usage_value:,.2f} units.")
+
+    burn_rate_value = insights.get("burn_rate")
+    if not isinstance(burn_rate_value, (int, float)):
+        avg_value = insights.get("average_per_period")
+        if isinstance(avg_value, (int, float)):
+            burn_rate_value = avg_value
+    period_count = insights.get("period_count")
+    if isinstance(burn_rate_value, (int, float)) and isinstance(period_count, int) and period_count > 0:
+        granularity = None
+        for entry in periods:
+            if isinstance(entry, Mapping):
+                granularity = entry.get("granularity")
+                if granularity:
+                    break
+        if granularity == "month":
+            unit_label = "units/month"
+            span_label = "month" if period_count == 1 else "months"
+        elif granularity == "year":
+            unit_label = "units/year"
+            span_label = "year" if period_count == 1 else "years"
+        elif granularity == "week":
+            unit_label = "units/week"
+            span_label = "week" if period_count == 1 else "weeks"
+        else:
+            unit_label = "units per period"
+            span_label = "period" if period_count == 1 else "periods"
+        message_parts.append(
+            f"Average burn rate over the last {period_count} {span_label}: {burn_rate_value:,.2f} {unit_label}."
+        )
+
     multiplier = insights.get("multiplier")
     scaled = insights.get("scaled")
     if multiplier is not None and isinstance(scaled, (int, float)):
@@ -5360,12 +6061,12 @@ def describe_reorder_message(insights: dict | None) -> str:
         if months and total_usage is not None:
             usage_sentence = f"Last {months} months consumed {total_usage:,.0f} units"
             if avg_usage is not None:
-                usage_sentence += f" (~{avg_usage:,.0f}/month)"
+                usage_sentence += f" (~{avg_usage:,.0f}/month burn rate)"
             usage_sentence += "."
             parts.append(usage_sentence)
             if cover_need is not None:
                 parts.append(
-                    f"Covering another {months} months would take about {cover_need:,.0f} additional units after today's availability."
+                    f"At that burn rate you'd need roughly {cover_need:,.0f} more units to cover another {months} months beyond today's availability."
                 )
             if recommended is not None:
                 parts.append(
@@ -5579,6 +6280,120 @@ def build_business_context_note(prompt: str, context: Mapping | None, sql_payloa
     return " ".join(part for part in parts if part).strip()
 
 
+BOM_EXPLOSION_SQL = """
+WITH BOM_CTE AS (
+    SELECT
+        1 AS LevelNumber,
+        RTRIM(bom.PPN_I) AS ParentItem,
+        NULLIF(RTRIM(bom.BOMNAME_I), '') AS BomName,
+        RTRIM(bom.CPN_I) AS ComponentItem,
+        bom.QUANTITY_I AS QuantityPerParent,
+        RTRIM(bom.UOFM) AS UofM,
+        CAST(bom.QUANTITY_I AS decimal(38, 10)) AS ExtendedQuantity,
+        CAST('>' + RTRIM(bom.PPN_I) + '>' + RTRIM(bom.CPN_I) + '>' AS nvarchar(4000)) AS TraversalPath
+    FROM BM010115 AS bom
+    WHERE RTRIM(bom.PPN_I) = ?
+      AND LEN(RTRIM(bom.CPN_I)) > 0
+    UNION ALL
+    SELECT
+        c.LevelNumber + 1,
+        RTRIM(bom.PPN_I),
+        NULLIF(RTRIM(bom.BOMNAME_I), ''),
+        RTRIM(bom.CPN_I),
+        bom.QUANTITY_I,
+        RTRIM(bom.UOFM),
+        CAST(c.ExtendedQuantity * bom.QUANTITY_I AS decimal(38, 10)),
+        CAST(c.TraversalPath + RTRIM(bom.CPN_I) + '>' AS nvarchar(4000))
+    FROM BOM_CTE AS c
+    INNER JOIN BM010115 AS bom
+        ON RTRIM(bom.PPN_I) = c.ComponentItem
+    WHERE LEN(RTRIM(bom.CPN_I)) > 0
+      AND CHARINDEX('>' + RTRIM(bom.CPN_I) + '>', c.TraversalPath) = 0
+)
+SELECT
+    c.LevelNumber,
+    c.ParentItem,
+    parent_desc.ITEMDESC AS ParentDescription,
+    c.ComponentItem,
+    comp_desc.ITEMDESC AS ComponentDescription,
+    c.QuantityPerParent,
+    c.UofM,
+    c.ExtendedQuantity,
+    c.BomName
+FROM BOM_CTE AS c
+LEFT JOIN IV00101 AS parent_desc
+    ON RTRIM(parent_desc.ITEMNMBR) = c.ParentItem
+LEFT JOIN IV00101 AS comp_desc
+    ON RTRIM(comp_desc.ITEMNMBR) = c.ComponentItem
+ORDER BY c.LevelNumber, c.ParentItem, c.ComponentItem
+OPTION (MAXRECURSION 32);
+"""
+
+
+def _summarize_bom_rows(item_code: str, rows: Iterable[Mapping]) -> str:
+    rows_iter = list(rows)
+    if not rows_iter:
+        return f"No bill of materials rows found for {item_code}."
+    max_level = 0
+    unique_components: set[str] = set()
+    for row in rows_iter:
+        level_value = row.get("LevelNumber") if isinstance(row, Mapping) else None
+        try:
+            level_int = int(level_value)
+        except (TypeError, ValueError):
+            level_int = 0
+        if level_int > max_level:
+            max_level = level_int
+        component_value = row.get("ComponentItem") if isinstance(row, Mapping) else None
+        if isinstance(component_value, str) and component_value.strip():
+            unique_components.add(component_value.strip())
+    if not unique_components:
+        return f"No bill of materials rows found for {item_code}."
+    component_label = "component" if len(unique_components) == 1 else "components"
+    level_label = "level" if max_level == 1 else "levels"
+    return f"{item_code} BOM spans {max_level} {level_label} covering {len(unique_components)} unique {component_label}."
+
+
+def maybe_handle_bom_explosion(
+    cursor: pyodbc.Cursor, prompt: str | None, context: dict | None
+) -> dict | None:
+    if not prompt or not looks_like_bom_prompt(prompt):
+        return None
+    item_code = resolve_item_from_context(prompt, context)
+    if not item_code:
+        return {
+            "error": "I need an item number to explode the bill of materials. Please mention the specific item (e.g., 'SOARBLM00').",
+            "data": None,
+            "sql": None,
+            "context_type": CUSTOM_SQL_INTENT,
+        }
+    params = (item_code,)
+    sql_preview = format_sql_preview(BOM_EXPLOSION_SQL, params)
+    try:
+        cursor.execute(BOM_EXPLOSION_SQL, params)
+        fetched = cursor.fetchall()
+        columns = [col[0] for col in cursor.description] if cursor.description else []
+    except pyodbc.Error as err:
+        return {
+            "error": f"Bill of materials query failed: {err}",
+            "data": None,
+            "sql": sql_preview,
+            "context_type": CUSTOM_SQL_INTENT,
+        }
+    rows: list[dict] = []
+    if columns:
+        for record in fetched:
+            rows.append(dict(zip(columns, record)))
+    summary = _summarize_bom_rows(item_code, rows)
+    insights = {"summary": summary, "row_count": len(rows)}
+    return {
+        "data": rows,
+        "sql": sql_preview,
+        "context_type": CUSTOM_SQL_INTENT,
+        "insights": insights,
+    }
+
+
 def describe_custom_sql_message(insights: dict | None) -> str:
     if not insights:
         return "Custom SQL results are ready."
@@ -5596,10 +6411,446 @@ def describe_custom_sql_message(insights: dict | None) -> str:
     return " ".join(parts) if parts else "Custom SQL results are ready."
 
 
+LLM_SNAPSHOT_ROW_LIMIT = 3
+LLM_SNAPSHOT_MAX_CHARS = 2000
+LLM_SNAPSHOT_NUMERIC_KEYS = (
+    "total",
+    "average",
+    "avg",
+    "sum",
+    "scaled",
+    "count",
+    "difference",
+    "percent",
+    "pct",
+    "coverage",
+    "gap",
+)
+
+
+def build_llm_data_snapshot(
+    data,
+    insights: Mapping | None,
+    *,
+    context_type: str | None = None,
+    sql_text: str | None = None,
+) -> str | None:
+    row_count = _infer_snapshot_row_count(data, insights)
+    rows = _extract_snapshot_rows(data, limit=LLM_SNAPSHOT_ROW_LIMIT)
+    metrics = _extract_snapshot_metrics(insights)
+    period_info = _extract_snapshot_periods(insights)
+    summary_parts: list[str] = []
+    if context_type:
+        summary_parts.append(f"context={context_type}")
+    if row_count is not None:
+        summary_parts.append(f"rows_returned={row_count}")
+    if period_info:
+        summary_parts.append(f"periods={_snapshot_json(period_info)}")
+    if metrics:
+        summary_parts.append(f"metrics={_snapshot_json(metrics)}")
+    if not rows and isinstance(insights, Mapping):
+        top_item = insights.get("top_item")
+        if isinstance(top_item, Mapping):
+            normalized_top = _normalize_snapshot_row(top_item)
+            if normalized_top:
+                rows.append(normalized_top)
+        top_items = insights.get("top_items")
+        if isinstance(top_items, list):
+            for entry in top_items:
+                if len(rows) >= LLM_SNAPSHOT_ROW_LIMIT:
+                    break
+                normalized_entry = _normalize_snapshot_row(entry)
+                if normalized_entry:
+                    rows.append(normalized_entry)
+    if rows:
+        summary_parts.append(f"sample_rows={_snapshot_json(rows)}")
+    if isinstance(sql_text, str):
+        sql_compact = " ".join(sql_text.split())
+        if sql_compact:
+            summary_parts.append(f"sql_preview={_truncate_snapshot(sql_compact)}")
+    if not summary_parts:
+        return None
+    snapshot = " | ".join(summary_parts)
+    if len(snapshot) > LLM_SNAPSHOT_MAX_CHARS:
+        snapshot = snapshot[: LLM_SNAPSHOT_MAX_CHARS - 3] + "..."
+    return snapshot
+
+
+def _truncate_snapshot(text: str, limit: int = 400) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _infer_snapshot_row_count(data, insights: Mapping | None) -> int | None:
+    if isinstance(data, pd.DataFrame):
+        return int(data.shape[0])
+    if isinstance(data, list):
+        return len(data)
+    if isinstance(data, Mapping):
+        return 1 if data else 0
+    if isinstance(insights, Mapping):
+        for key in ("row_count", "scanned_count", "count"):
+            value = insights.get(key)
+            if isinstance(value, Number) and not isinstance(value, bool):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
+def _extract_snapshot_rows(data, *, limit: int) -> list[dict]:
+    rows: list[dict] = []
+    if data is None:
+        return rows
+    if isinstance(data, pd.DataFrame):
+        if data.empty:
+            return rows
+        try:
+            records = data.head(limit).to_dict(orient="records")
+        except (ValueError, AttributeError):
+            records = []
+        for record in records:
+            normalized = _normalize_snapshot_row(record)
+            if normalized:
+                rows.append(normalized)
+        return rows
+    if isinstance(data, list):
+        for row in data:
+            if len(rows) >= limit:
+                break
+            normalized = _normalize_snapshot_row(row)
+            if normalized:
+                rows.append(normalized)
+        return rows
+    normalized = _normalize_snapshot_row(data)
+    if normalized:
+        rows.append(normalized)
+    return rows
+
+
+def _normalize_snapshot_row(row) -> dict | None:
+    if row is None:
+        return None
+    if isinstance(row, Mapping):
+        normalized: dict[str, object] = {}
+        for key, value in row.items():
+            normalized[str(key)] = _coerce_snapshot_value(value)
+        return normalized
+    if hasattr(row, "_asdict"):
+        return _normalize_snapshot_row(row._asdict())
+    if isinstance(row, Iterable) and not isinstance(row, (str, bytes)):
+        normalized_iterable: dict[str, object] = {}
+        for idx, value in enumerate(row):
+            normalized_iterable[f"col_{idx}"] = _coerce_snapshot_value(value)
+        return normalized_iterable
+    return {"value": _coerce_snapshot_value(row)}
+
+
+def _extract_snapshot_metrics(insights: Mapping | None) -> dict:
+    metrics: dict[str, float] = {}
+    if not isinstance(insights, Mapping):
+        return metrics
+
+    def _scan(mapping: Mapping, prefix: str = "") -> None:
+        if len(metrics) >= 12:
+            return
+        for key, value in mapping.items():
+            label = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, Mapping):
+                _scan(value, label)
+                if len(metrics) >= 12:
+                    return
+                continue
+            if isinstance(value, Number) and not isinstance(value, bool):
+                lowered = label.lower()
+                if any(token in lowered for token in LLM_SNAPSHOT_NUMERIC_KEYS):
+                    try:
+                        metrics[label] = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if len(metrics) >= 12:
+                        return
+
+    _scan(insights)
+    return metrics
+
+
+def _extract_snapshot_periods(insights: Mapping | None) -> dict:
+    if not isinstance(insights, Mapping):
+        return {}
+    period_info: dict[str, object] = {}
+    label = insights.get("period") or insights.get("period_label")
+    if isinstance(label, str) and label.strip():
+        period_info["label"] = label.strip()
+    start = insights.get("period_start")
+    end = insights.get("period_end")
+    if start:
+        period_info["start"] = _coerce_snapshot_value(start)
+    if end:
+        period_info["end"] = _coerce_snapshot_value(end)
+    periods = insights.get("periods")
+    if isinstance(periods, list) and periods:
+        cleaned: list[dict] = []
+        for entry in periods[:LLM_SNAPSHOT_ROW_LIMIT]:
+            normalized = _normalize_snapshot_row(entry)
+            if normalized:
+                cleaned.append(normalized)
+        if cleaned:
+            period_info["series"] = cleaned
+    resolved = insights.get("resolved_periods")
+    if isinstance(resolved, list) and resolved and "series" not in period_info:
+        cleaned: list[dict] = []
+        for entry in resolved[:LLM_SNAPSHOT_ROW_LIMIT]:
+            normalized = _normalize_snapshot_row(entry)
+            if normalized:
+                cleaned.append(normalized)
+        if cleaned:
+            period_info["series"] = cleaned
+    return period_info
+
+
+def _coerce_snapshot_value(value):
+    if value is None:
+        return None
+    try:
+        pd_isna = pd.isna  # type: ignore[attr-defined]
+    except AttributeError:  # pragma: no cover - pandas always available
+        pd_isna = None
+    if pd_isna is not None:
+        try:
+            if pd_isna(value):
+                return None
+        except Exception:
+            pass
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    if isinstance(value, Number):
+        number = float(value)
+        if math.isnan(number) or math.isinf(number):
+            return None
+        return number
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()  # pandas Timestamp
+        except Exception:
+            pass
+    if hasattr(value, "item"):
+        try:
+            return _coerce_snapshot_value(value.item())
+        except Exception:
+            pass
+    return str(value)
+
+
+def _snapshot_json(payload: object) -> str:
+    return json.dumps(payload, default=_snapshot_default)
+
+
+def _snapshot_default(value):
+    coerced = _coerce_snapshot_value(value)
+    if isinstance(coerced, float) and (math.isnan(coerced) or math.isinf(coerced)):
+        return None
+    return coerced
+
+
+def _column_matches_keywords(column_name: str | None, keywords: Sequence[str]) -> bool:
+    if not column_name:
+        return False
+    lowered = column_name.lower()
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _first_non_null(values: Sequence[object]) -> object | None:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _is_dimension_column(column_name: str, values: Sequence[object]) -> bool:
+    sample = _first_non_null(values)
+    if sample is None:
+        return False
+    if isinstance(sample, (datetime.date, datetime.datetime, str)):
+        return True
+    if isinstance(sample, Number) and not isinstance(sample, bool):
+        return _column_matches_keywords(column_name, CUSTOM_SQL_CHART_DIMENSION_KEYWORDS)
+    return False
+
+
+def _is_metric_column(values: Sequence[object]) -> bool:
+    has_numeric = False
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, Number) and not isinstance(value, bool):
+            has_numeric = True
+            continue
+        return False
+    return has_numeric
+
+
+def _humanize_column_label(column_name: str | None) -> str:
+    if not column_name:
+        return ""
+    cleaned = re.sub(r"[_\s]+", " ", column_name).strip()
+    return cleaned.title() if cleaned else column_name
+
+
+def _format_dimension_value(value: object, column_name: str) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, Number) and not isinstance(value, bool):
+        lowered = column_name.lower()
+        if "month" in lowered:
+            try:
+                month_index = int(value)
+            except (TypeError, ValueError):
+                month_index = None
+            if month_index and 1 <= month_index <= 12:
+                month_label = calendar.month_abbr[month_index] or str(month_index)
+                return month_label.upper()
+        if isinstance(value, (int, float)):
+            return f"{value:g}"
+        return str(value)
+    return str(value)
+
+
+def build_custom_sql_chart(
+    rows: list[Mapping[str, object]],
+    columns: Sequence[str],
+    item_code: str | None = None,
+) -> tuple[dict | None, str | None, str | None]:
+    if len(rows) < 2:
+        return None, None, None
+    column_order: list[str] = list(columns) if columns else []
+    if not column_order:
+        for row in rows:
+            for key in row.keys():
+                if key not in column_order:
+                    column_order.append(key)
+    if not column_order:
+        return None, None, None
+
+    values_by_column: dict[str, list[object]] = {}
+    for column_name in column_order:
+        values_by_column[column_name] = [
+            row.get(column_name) for row in rows if isinstance(row, Mapping)
+        ]
+
+    dimension_candidates: list[tuple[int, str]] = []
+    metric_candidates: list[tuple[int, str]] = []
+
+    for column_name in column_order:
+        values = values_by_column.get(column_name) or []
+        if not values:
+            continue
+        if _is_dimension_column(column_name, values):
+            score = 2 if _column_matches_keywords(column_name, CUSTOM_SQL_CHART_DIMENSION_KEYWORDS) else 1
+            dimension_candidates.append((score, column_name))
+        if _is_metric_column(values):
+            score = 2 if _column_matches_keywords(column_name, CUSTOM_SQL_CHART_METRIC_KEYWORDS) else 1
+            metric_candidates.append((score, column_name))
+
+    if not dimension_candidates:
+        for column_name in column_order:
+            values = values_by_column.get(column_name) or []
+            sample = _first_non_null(values)
+            if isinstance(sample, str) and sample.strip():
+                dimension_candidates.append((0, column_name))
+                break
+
+    if not dimension_candidates:
+        return None, None, None
+
+    def _sort_key(candidate: tuple[int, str]) -> tuple[int, int]:
+        column_name = candidate[1]
+        try:
+            order = column_order.index(column_name)
+        except ValueError:
+            order = len(column_order)
+        return (-candidate[0], order)
+
+    dimension_candidates.sort(key=_sort_key)
+    dimension_field = dimension_candidates[0][1]
+
+    metric_candidates = [candidate for candidate in metric_candidates if candidate[1] != dimension_field]
+    if not metric_candidates:
+        for column_name in column_order:
+            if column_name == dimension_field:
+                continue
+            values = values_by_column.get(column_name) or []
+            if _is_metric_column(values):
+                metric_candidates.append((0, column_name))
+
+    if not metric_candidates:
+        return None, None, None
+
+    metric_candidates.sort(key=_sort_key)
+    metric_field = metric_candidates[0][1]
+
+    chart_points: list[dict[str, object]] = []
+    for sequence, row in enumerate(rows):
+        raw_label = row.get(dimension_field)
+        label = _format_dimension_value(raw_label, dimension_field)
+        if not label:
+            continue
+        raw_metric = row.get(metric_field)
+        if not isinstance(raw_metric, Number) or isinstance(raw_metric, bool):
+            continue
+        try:
+            metric_value = float(raw_metric)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(metric_value) or math.isinf(metric_value):
+            continue
+        chart_points.append(
+            {
+                "Period": label,
+                metric_field: metric_value,
+                "_sequence": sequence,
+            }
+        )
+
+    if len(chart_points) < 2:
+        return None, None, None
+
+    value_label = _humanize_column_label(metric_field)
+    dimension_label = _humanize_column_label(dimension_field)
+    title = f"{value_label} by {dimension_label}".strip()
+    chart_payload: dict[str, object] = {
+        "type": "line",
+        "title": title,
+        "data": chart_points,
+        "x_field": "Period",
+        "y_field": metric_field,
+        "value_label": value_label or metric_field,
+        "height": 280,
+    }
+    if item_code:
+        chart_payload["item"] = item_code
+    return chart_payload, dimension_label or dimension_field, value_label or metric_field
+
+
 def handle_custom_sql_question(
     cursor: pyodbc.Cursor, prompt: str, today: datetime.date, context: dict | None = None
 ) -> dict:
     context = context or {}
+    bom_payload = maybe_handle_bom_explosion(cursor, prompt, context)
+    if bom_payload is not None:
+        return bom_payload
     schema = load_allowed_sql_schema(cursor)
     if not schema:
         return {
@@ -5660,12 +6911,61 @@ def handle_custom_sql_question(
     }
     if truncated:
         insights["note"] = f"Showing first {CUSTOM_SQL_MAX_ROWS} rows."
-    return {
+    chart_payload = None
+    chart_caption = None
+    chart_warning = None
+    if context.get("graph_requested"):
+        item_code = context.get("item") if isinstance(context.get("item"), str) else None
+        chart_payload, dimension_label, value_label = build_custom_sql_chart(rows, columns, item_code)
+        if chart_payload and value_label and dimension_label:
+            chart_caption = f"Line chart below: {value_label} by {dimension_label}."
+        else:
+            chart_warning = (
+                "I couldn't convert that result set into a chart. Include a time column plus a numeric metric to plot."
+            )
+
+    result = {
         "data": rows,
         "sql": sql_preview or sql_text,
         "context_type": CUSTOM_SQL_INTENT,
         "insights": insights,
     }
+    if chart_payload:
+        result["chart"] = chart_payload
+    if chart_caption:
+        result["chart_caption"] = chart_caption
+    if chart_warning:
+        result["chart_warning"] = chart_warning
+    return result
+
+
+def format_reasoning_for_message(reasoning: Mapping | None) -> str | None:
+    if not isinstance(reasoning, Mapping):
+        return None
+    sections: list[str] = []
+    steps_value = reasoning.get("steps")
+    if isinstance(steps_value, Sequence) and not isinstance(steps_value, (str, bytes, bytearray)):
+        rendered_steps: list[str] = []
+        for index, step in enumerate(steps_value[:REASONING_STEP_LIMIT], start=1):
+            step_text = step if isinstance(step, str) else str(step)
+            step_text = step_text.strip()
+            if step_text:
+                rendered_steps.append(f"{index}. {step_text}")
+        if rendered_steps:
+            sections.append("Reasoning steps:\n" + "\n".join(rendered_steps))
+    conclusion = reasoning.get("conclusion")
+    if isinstance(conclusion, str):
+        conclusion_text = conclusion.strip()
+        if conclusion_text:
+            sections.append(f"Conclusion: {conclusion_text}")
+    confidence = reasoning.get("confidence")
+    if isinstance(confidence, str):
+        confidence_text = confidence.strip()
+        if confidence_text:
+            sections.append(f"Confidence: {confidence_text}")
+    if sections:
+        return "\n\n".join(sections)
+    return None
 
 
 def compose_conversational_message(
@@ -5725,6 +7025,10 @@ def compose_conversational_message(
         reply_sections.append(describe_why_drop_message(insights))
     elif intent == CUSTOM_SQL_INTENT:
         reply_sections.append(describe_custom_sql_message(insights))
+
+    reasoning_section = format_reasoning_for_message(sql_payload.get("reasoning"))
+    if reasoning_section:
+        reply_sections.append(reasoning_section)
 
     context_note = build_business_context_note(prompt, context, sql_payload)
     if context_note:
@@ -5814,12 +7118,27 @@ def handle_chat_prompt(
     elif intent != "chitchat":
         sql_payload = handle_usage_question(cursor, prompt, today, context)
 
+    if sql_payload:
+        sanitized_insights = sanitize_insights_for_session(sql_payload.get("insights"))
+        if sanitized_insights:
+            context["insights"] = sanitized_insights
+        row_summary = build_row_aggregates(sql_payload.get("data"))
+        if row_summary:
+            context["row_aggregates"] = row_summary
+        if not sql_payload.get("error"):
+            reasoning_summary = call_openai_reasoner(prompt, today, context, sql_payload)
+            if reasoning_summary:
+                sql_payload["reasoning"] = reasoning_summary
+                context["reasoning"] = reasoning_summary
+
     message = compose_conversational_message(prompt, context, sql_payload, session_history)
     result = {
         "message": message,
         "data": sql_payload.get("data") if sql_payload else None,
         "sql": sql_payload.get("sql") if sql_payload else None,
         "chart": sql_payload.get("chart") if sql_payload else None,
+        "insights": sql_payload.get("insights") if sql_payload else None,
+        "reasoning": sql_payload.get("reasoning") if sql_payload else None,
         "context_type": (
             sql_payload.get("context_type")
             if sql_payload and sql_payload.get("context_type")
@@ -5875,6 +7194,8 @@ def execute_chat_turn(
             "sql": result.get("sql"),
             "data": result.get("data"),
             "chart": result.get("chart"),
+            "insights": result.get("insights"),
+            "reasoning": result.get("reasoning"),
             "context": result.get("context"),
             "context_type": result.get("context_type"),
         }
@@ -5885,7 +7206,7 @@ def execute_chat_turn(
             conn.close()
 
 
-def render_sql_chat(today: datetime.date, current_user: dict | None = None) -> None:
+def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> None:
     st.subheader("SQL-style data chat")
     st.caption(
         "Ask plain-language questions about Dynamics GP data. "
@@ -5897,7 +7218,7 @@ def render_sql_chat(today: datetime.date, current_user: dict | None = None) -> N
     )
 
     user_id = get_authenticated_user_id()
-    user = current_user or get_authenticated_user()
+    user = user_override or get_authenticated_user()
     user_label = "Guest"
     if user:
         user_label = (
@@ -6125,11 +7446,7 @@ def render_sql_chat(today: datetime.date, current_user: dict | None = None) -> N
         }
     )
 
-    history_for_llm = [
-        {"role": entry["role"], "content": entry["content"]}
-        for entry in history[-6:]
-        if entry["role"] in {"user", "assistant"}
-    ]
+    history_for_llm = build_history_messages_for_llm(history)
     feedback_note = build_feedback_instruction(
         st.session_state.get(feedback_value_key, ""),
         feedback_log,
@@ -6162,6 +7479,14 @@ def render_sql_chat(today: datetime.date, current_user: dict | None = None) -> N
     if correction_payload:
         context_type = "correction"
         response["context_type"] = context_type
+    llm_snapshot = build_llm_data_snapshot(
+        response.get("data"),
+        response.get("insights"),
+        context_type=context_type,
+        sql_text=response.get("sql"),
+    )
+    if llm_snapshot:
+        response["llm_data_snapshot"] = llm_snapshot
     history.append(
         {
             "id": assistant_message_id,
@@ -6170,9 +7495,12 @@ def render_sql_chat(today: datetime.date, current_user: dict | None = None) -> N
             "sql": response.get("sql"),
             "data": response.get("data"),
             "chart": response.get("chart"),
+            "insights": response.get("insights"),
+            "reasoning": response.get("reasoning"),
             "context_type": context_type,
             "context": response.get("context"),
             "source_prompt": prompt_for_execution,
+            "llm_data_snapshot": llm_snapshot,
         }
     )
     log_chat_event(
@@ -6186,6 +7514,9 @@ def render_sql_chat(today: datetime.date, current_user: dict | None = None) -> N
             "sql": response.get("sql"),
             "chart": response.get("chart"),
             "context": response.get("context"),
+            "insights": response.get("insights"),
+            "reasoning": response.get("reasoning"),
+            "llm_data_snapshot": llm_snapshot,
         }
     )
     update_session_context(session_context, response.get("context"))

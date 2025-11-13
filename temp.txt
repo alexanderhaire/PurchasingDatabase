@@ -1,0 +1,400 @@
+            if st.button("Sign out", key="chat_logout_button"):
+                logout_current_user()
+        st.header("Chats")
+        for session in sessions:
+            label = session["name"]
+            if session["id"] == active_session["id"]:
+                label = f"* {label}"
+            if st.button(label, key=f"select_session_{session['id']}"):
+                st.session_state[active_session_state_key] = session["id"]
+                st.rerun()
+
+        new_name = st.text_input(
+            "Chat title",
+            value=active_session["name"],
+            key=f"chat_name_{active_session['id']}",
+        )
+        if new_name.strip() and new_name != active_session["name"]:
+            active_session["name"] = new_name.strip()
+
+        if st.button("New chat", key="create_new_chat"):
+            new_session = {
+                "id": uuid.uuid4().hex,
+                "name": f"Chat {len(sessions) + 1}",
+                "history": [],
+            }
+            sessions.append(new_session)
+            st.session_state[active_session_state_key] = new_session["id"]
+            st.rerun()
+    st.text_area(
+        "Assistant guidance (optional)",
+        key=feedback_value_key,
+        help="Persistent feedback I'll honor for every reply. "
+        "This does not trigger a query; it's saved immediately.",
+    )
+    for entry in history:
+        entry.setdefault("id", uuid.uuid4().hex)
+        with st.chat_message(entry["role"]):
+            st.markdown(entry["content"])
+            if entry.get("sql"):
+                st.code(entry["sql"], language="sql")
+            if entry.get("data"):
+                st.dataframe(entry["data"], width="stretch")
+            chart_payload = entry.get("chart")
+            if isinstance(chart_payload, dict):
+                chart_data = chart_payload.get("data")
+                x_field = chart_payload.get("x_field") or "Period"
+                y_field = chart_payload.get("y_field")
+                if isinstance(chart_data, list) and chart_data and y_field:
+                    chart_df = None
+                    try:
+                        chart_df = pd.DataFrame(chart_data)
+                    except ValueError:
+                        chart_df = None
+                    if chart_df is not None and x_field in chart_df.columns and y_field in chart_df.columns:
+                        if "_sequence" in chart_df.columns:
+                            chart_df = chart_df.sort_values("_sequence")
+                        chart_df = chart_df[[x_field, y_field]].copy()
+                        value_label = chart_payload.get("value_label") or y_field
+                        chart_df = chart_df.rename(columns={y_field: value_label}).set_index(x_field)
+                        title = chart_payload.get("title")
+                        if isinstance(title, str) and title.strip():
+                            st.caption(title.strip())
+                        try:
+                            st.line_chart(chart_df, height=chart_payload.get("height") or 260)
+                        except StreamlitAPIException:
+                            st.dataframe(chart_df, width="stretch")
+            if entry["role"] == "assistant":
+                cols = st.columns([0.6, 0.6, 4])
+                with cols[0]:
+                    if st.button("👍", key=f"fb_up_{entry['id']}"):
+                        st.session_state[feedback_prompt_key] = {"id": entry["id"], "direction": "up"}
+                        st.rerun()
+                with cols[1]:
+                    if st.button("👎", key=f"fb_down_{entry['id']}"):
+                        st.session_state[feedback_prompt_key] = {"id": entry["id"], "direction": "down"}
+                        st.rerun()
+                prompt_info = st.session_state.get(feedback_prompt_key)
+                if prompt_info and prompt_info.get("id") == entry["id"]:
+                    direction = prompt_info.get("direction", "up")
+                    label = "What did I do well?" if direction == "up" else "How can I improve this answer?"
+                    with st.form(f"feedback_form_{entry['id']}"):
+                        comment = st.text_area(label, key=f"feedback_text_{entry['id']}", height=100)
+                        submit_cols = st.columns([1, 1])
+                        submitted = submit_cols[0].form_submit_button("Submit")
+                        cancelled = submit_cols[1].form_submit_button("Cancel")
+                        if submitted:
+                            comment_text = comment.strip()
+                            feedback_log.append(
+                                {
+                                    "message_id": entry["id"],
+                                    "direction": direction,
+                                    "comment": comment_text,
+                                    "session_id": active_session["id"],
+                                    "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                                }
+                            )
+                            apply_feedback_to_memory(entry["id"], direction, comment_text or None)
+                            st.session_state[feedback_prompt_key] = None
+                            st.rerun()
+                        if cancelled:
+                            st.session_state[feedback_prompt_key] = None
+                            st.rerun()
+
+    prompt = st.chat_input("What data can I pull for you?")
+    if not prompt:
+        return
+
+    def respond_with_correction_error(message: str) -> None:
+        history.append(
+            {
+                "id": uuid.uuid4().hex,
+                "role": "user",
+                "content": prompt,
+                "context_type": "correction",
+            }
+        )
+        history.append(
+            {
+                "id": uuid.uuid4().hex,
+                "role": "assistant",
+                "content": message,
+                "context_type": "correction",
+            }
+        )
+        st.rerun()
+
+    normalized = prompt.strip()
+    lowered_prompt = normalized.lower()
+    if lowered_prompt in RESET_COMMANDS:
+        active_session["history"].clear()
+        session_context.clear()
+        st.rerun()
+    if lowered_prompt.startswith("feedback:"):
+        st.session_state[feedback_value_key] = normalized.split(":", 1)[1].strip()
+        history.append(
+            {
+                "id": uuid.uuid4().hex,
+                "role": "assistant",
+                "content": "Thanks for the feedback - I'll keep that in mind.",
+            }
+        )
+        st.rerun()
+
+    correction_payload: dict | None = None
+    prompt_for_execution = prompt
+    correction_prefix = next((prefix for prefix in CORRECTION_PREFIXES if lowered_prompt.startswith(prefix)), None)
+    if correction_prefix:
+        parts = normalized.split(":", 1)
+        correction_text = parts[1].strip() if len(parts) > 1 else ""
+        last_assistant_entry = find_last_history_entry(history, "assistant")
+        if not last_assistant_entry:
+            respond_with_correction_error(
+                "I don't have a previous answer to fix yet. Ask a question first, then tell me what to adjust."
+            )
+            return
+        original_prompt = last_assistant_entry.get("source_prompt") or find_prior_user_prompt(
+            history, last_assistant_entry.get("id")
+        )
+        if not original_prompt:
+            respond_with_correction_error("I couldn't locate the earlier request. Please restate what you'd like me to pull.")
+            return
+        if not correction_text:
+            respond_with_correction_error("Tell me what to change (for example, 'use December too' or 'wrong intent').")
+            return
+        prompt_for_execution = f"{original_prompt}\n\nCorrection requested: {correction_text}"
+        correction_payload = {
+            "original_prompt": original_prompt,
+            "correction_text": correction_text,
+            "target_entry": last_assistant_entry,
+            "prompt_for_execution": prompt_for_execution,
+        }
+
+    seed_item = extract_item_code(prompt_for_execution) or session_context.get("item")
+    seed_month, seed_year = infer_period_from_text(prompt_for_execution, today)
+    seed_entities = {"item": seed_item, "month": seed_month, "year": seed_year}
+    memory_context_entries = retrieve_semantic_context(prompt_for_execution, seed_entities)
+
+    user_entry = {
+        "id": uuid.uuid4().hex,
+        "role": "user",
+        "content": prompt,
+        "resolved_prompt": prompt_for_execution,
+    }
+    if correction_payload:
+        user_entry["context_type"] = "correction"
+        target_id = correction_payload["target_entry"].get("id")
+        if target_id:
+            user_entry["metadata"] = {"correction_for": target_id}
+    history.append(user_entry)
+    log_chat_event(
+        {
+            "type": "user",
+            "user_id": user_id,
+            "session_id": active_session["id"],
+            "message_id": user_entry["id"],
+            "content": prompt,
+            "resolved_prompt": prompt_for_execution,
+            "context_type": user_entry.get("context_type"),
+            "context": user_entry.get("metadata"),
+        }
+    )
+
+    history_for_llm = [
+        {"role": entry["role"], "content": entry["content"]}
+        for entry in history[-6:]
+        if entry["role"] in {"user", "assistant"}
+    ]
+    feedback_note = build_feedback_instruction(
+        st.session_state.get(feedback_value_key, ""),
+        feedback_log,
+        active_session["id"],
+    )
+
+    override_context = None
+    if correction_payload:
+        override_context = interpret_prompt(
+            prompt_for_execution,
+            today,
+            history=history_for_llm,
+            feedback=feedback_note,
+            memory_context=memory_context_entries,
+            session_context=session_context,
+        )
+
+    response = execute_chat_turn(
+        prompt_for_execution,
+        today,
+        history_messages=history_for_llm,
+        feedback_note=feedback_note,
+        session_history=history,
+        session_context=session_context,
+        memory_context=memory_context_entries,
+        override_context=override_context,
+    )
+    assistant_message_id = uuid.uuid4().hex
+    context_type = response.get("context_type")
+    if correction_payload:
+        context_type = "correction"
+        response["context_type"] = context_type
+    history.append(
+        {
+            "id": assistant_message_id,
+            "role": "assistant",
+            "content": response.get("content", "Done."),
+            "sql": response.get("sql"),
+            "data": response.get("data"),
+            "chart": response.get("chart"),
+            "context_type": context_type,
+            "context": response.get("context"),
+            "source_prompt": prompt_for_execution,
+        }
+    )
+    log_chat_event(
+        {
+            "type": "assistant",
+            "user_id": user_id,
+            "session_id": active_session["id"],
+            "message_id": assistant_message_id,
+            "content": response.get("content"),
+            "context_type": context_type,
+            "sql": response.get("sql"),
+            "chart": response.get("chart"),
+            "context": response.get("context"),
+        }
+    )
+    update_session_context(session_context, response.get("context"))
+    record_memory_entry(
+        prompt_for_execution,
+        response,
+        active_session["id"],
+        assistant_message_id,
+        user_id=user_id,
+    )
+    if correction_payload:
+        previous_context = correction_payload["target_entry"].get("context")
+        override_used = override_context or response.get("context")
+        record_correction(
+            {
+                "user_prompt": correction_payload["original_prompt"],
+                "session_snapshot": build_session_snapshot_from_context(previous_context),
+                "llm_interpretation": {
+                    "intent": (previous_context or {}).get("intent"),
+                    "entities": (previous_context or {}).get("entities"),
+                },
+                "sql_preview": correction_payload["target_entry"].get("sql"),
+                "error_reported": correction_payload["correction_text"],
+                "corrective_action": summarize_correction_action(override_used, correction_payload["correction_text"]),
+                "correct_intent": (override_used or {}).get("intent"),
+                "target_message_id": correction_payload["target_entry"].get("id"),
+            },
+            user_id=user_id,
+        )
+    st.rerun()
+ITEMS_QUERY = """
+SELECT i.ITEMNMBR, i.QTYONHND, i.ORDRPNTQTY, i.QTYONORD,
+       (i.QTYONHND - i.ATYALLOC) AS QtyAvailable, m.ITMCLSCD
+FROM IV00102 i
+JOIN IV00101 m ON m.ITEMNMBR = i.ITEMNMBR
+WHERE i.LOCNCODE = 'MAIN'
+  AND i.QTYONORD = 0
+  AND i.ORDRPNTQTY > (i.QTYONHND - i.ATYALLOC)
+  AND m.ITMCLSCD LIKE '%RAW%';
+"""
+
+USAGE_QUERY = """
+SELECT SUM(t.TRXQTY) AS UsageForPeriod
+FROM IV30300 t
+JOIN IV30200 h ON t.DOCNUMBR = h.DOCNUMBR AND t.DOCTYPE = h.IVDOCTYP
+WHERE t.ITEMNMBR = ?
+  AND t.DOCTYPE = 1               -- Only Adjustments
+  AND t.TRXQTY < 0                -- 👈 only negatives
+  AND h.DOCDATE >= ?
+  AND h.DOCDATE <= ?;
+"""
+
+SALES_QUERY = """
+SELECT SUM(
+           CASE
+               WHEN l.SOPTYPE = 4 THEN -ABS(l.QUANTITY)
+               ELSE ABS(l.QUANTITY)
+           END
+       ) AS SalesQuantity
+FROM SOP30300 l
+JOIN SOP30200 h ON h.SOPTYPE = l.SOPTYPE AND h.SOPNUMBE = l.SOPNUMBE
+WHERE l.ITEMNMBR = ?
+  AND h.DOCDATE >= ?
+  AND h.DOCDATE <= ?
+  AND l.SOPTYPE IN (3, 4);
+"""
+
+USAGE_BY_MONTH_QUERY = """
+SELECT
+    DATEFROMPARTS(YEAR(h.DOCDATE), MONTH(h.DOCDATE), 1) AS PeriodStart,
+    EOMONTH(h.DOCDATE) AS PeriodEnd,
+    DATENAME(MONTH, h.DOCDATE) + ' ' + CAST(YEAR(h.DOCDATE) AS varchar(4)) AS PeriodLabel,
+    SUM(t.TRXQTY) AS UsageForPeriod
+FROM IV30300 t
+JOIN IV30200 h ON t.DOCNUMBR = h.DOCNUMBR AND t.DOCTYPE = h.IVDOCTYP
+WHERE t.ITEMNMBR = ?
+  AND t.DOCTYPE = 1
+  AND t.TRXQTY < 0
+  AND h.DOCDATE BETWEEN ?
+  AND ?
+GROUP BY DATEFROMPARTS(YEAR(h.DOCDATE), MONTH(h.DOCDATE), 1),
+         EOMONTH(h.DOCDATE),
+         DATENAME(MONTH, h.DOCDATE),
+         YEAR(h.DOCDATE)
+ORDER BY PeriodStart;
+"""
+
+REORDER_QUERY = """
+SELECT TOP 25
+    i.ITEMNMBR,
+    m.ITEMDESC,
+    i.QTYONHND,
+    i.ATYALLOC,
+    (i.QTYONHND - i.ATYALLOC) AS QtyAvailable,
+    i.ORDRPNTQTY,
+    m.ITMCLSCD,
+    i.QTYONORD,
+    (i.ORDRPNTQTY - (i.QTYONHND - i.ATYALLOC)) AS Shortfall
+FROM IV00102 i
+JOIN IV00101 m ON m.ITEMNMBR = i.ITEMNMBR
+"""
+
+
+MONTH_INPUT_FORMATS = (
+    "%Y-%m",
+    "%m/%Y",
+    "%m-%Y",
+    "%B %Y",
+    "%b %Y",
+    "%Y %B",
+    "%Y %b",
+)
+
+HISTORICAL_YEARS = 2
+WHY_DROP_MONTH_WINDOW = 6
+MONTH_NAME_LOOKUP = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "sept": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+MONTH_NAME_REGEX = re.compile(
+    r"\b("
+    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+    r"aug(?:ust)?|sep(?:t|tember)|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+    r")\b(?:\s+(\d{2,4}))?",
+    flags=re.IGNORECASE,
+)
