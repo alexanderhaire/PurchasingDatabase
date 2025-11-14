@@ -11,6 +11,7 @@ import math
 import re
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from decimal import Decimal
 from functools import lru_cache
 from numbers import Number
@@ -20,7 +21,12 @@ from typing import Any, Callable, TypedDict
 import pyodbc
 import requests
 import pandas as pd
+import matplotlib.pyplot as plt
 import streamlit as st
+try:  # pragma: no cover - pandas always available in deployment.
+    from pandas.errors import PandasError
+except ImportError:  # pragma: no cover - fallback if pandas lacks errors module.
+    PandasError = ValueError  # type: ignore[assignment]
 from dateutil import parser as date_parser
 from streamlit.errors import StreamlitAPIException, StreamlitSecretNotFoundError
 
@@ -64,6 +70,7 @@ CHAT_ITEM_STOPWORDS = {
     "HEY",
     "DID",
     "FOR",
+    "FROM",
     "IN",
     "OF",
     "THE",
@@ -77,6 +84,7 @@ CHAT_ITEM_STOPWORDS = {
     "AND",
     "BY",
     "WHAT",
+    "WHICH",
     "WHO",
     "WHEN",
     "WHERE",
@@ -90,6 +98,7 @@ CHAT_ITEM_STOPWORDS = {
     "MEAN",
     "MEANS",
     "HAS",
+    "ARE",
     "HAVE",
     "HAVING",
     "HAD",
@@ -99,8 +108,19 @@ CHAT_ITEM_STOPWORDS = {
     "YOUR",
     "YOURS",
     "PAST",
+    "LAST",
+    "PRIOR",
+    "PREVIOUS",
+    "CURRENT",
+    "NEXT",
+    "MONTH",
+    "MONTHS",
+    "MONTHLY",
     "OVER",
+    "ABOVE",
+    "BELOW",
     "AVERAGE",
+    "UNDER",
     "NEED",
     "NEEDS",
     "NEEDED",
@@ -111,8 +131,12 @@ CHAT_ITEM_STOPWORDS = {
     "PURCHASES",
     "PURCHASING",
     "PURCHASED",
+    "GIVE",
+    "GIVES",
+    "GIVING",
     "THANK",
     "THANKS",
+    "HELLO",
     "ALSO",
     "CAN",
     "CANT",
@@ -134,6 +158,8 @@ CHAT_ITEM_STOPWORDS = {
     "PLOTS",
     "DRAW",
     "DRAWING",
+    "THROUGH",
+    "THRU",
     "CREATE",
     "CREATES",
     "CREATING",
@@ -143,6 +169,10 @@ CHAT_ITEM_STOPWORDS = {
     "INTO",
     "AGAIN",
     "ANOTHER",
+    "GROW",
+    "GROWTH",
+    "RATES",
+    "RATE",
 }
 ITEM_PRECEDING_KEYWORDS = {
     "FOR",
@@ -354,7 +384,7 @@ CORRECTION_PREFIXES = ("correction:", "fix:")
 CORRECTION_PROMPT_FOOTER = "If this isn’t what you meant, tell me what to fix (e.g., 'use December too' or 'wrong intent')."
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_DEFAULT_MODEL = "gpt-5.0"
-OPENAI_TIMEOUT_SECONDS = 15
+OPENAI_TIMEOUT_SECONDS = 50
 OPENAI_EMBEDDING_URL = "https://api.openai.com/v1/embeddings"
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
 REASONING_PREVIEW_ROWS = 24
@@ -394,6 +424,7 @@ CUSTOM_SQL_ALLOWED_TABLES: tuple[str, ...] = (
     "IV30300",
     "BM00101",
     "BM00111",
+    "BM010115",
     "POP10100",
     "POP10110",
     "POP30100",
@@ -671,6 +702,21 @@ def ensure_training_feedback_dir() -> Path:
 
 # JSON allows dict keys that are str/int/float/bool/None; anything else must be coerced.
 _JSON_KEY_SAFE_TYPES = (str, int, float, bool, type(None))
+# Some third-party values raise a variety of conversion errors (NumPy, pandas, PyTorch, etc.).
+
+
+@contextmanager
+def _suppress_value_errors():
+    try:
+        yield
+    except (
+        TypeError,
+        ValueError,
+        RuntimeError,
+        NotImplementedError,
+        PandasError,
+    ):
+        return
 
 
 def _json_log_safe_value(value: object) -> object:
@@ -711,15 +757,11 @@ def _json_log_safe_value(value: object) -> object:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     if hasattr(value, "isoformat"):
-        try:
+        with _suppress_value_errors():
             return value.isoformat()
-        except Exception:
-            pass
     if hasattr(value, "item"):
-        try:
+        with _suppress_value_errors():
             return _json_log_safe_value(value.item())
-        except Exception:
-            pass
     return str(value)
 
 
@@ -1618,6 +1660,25 @@ def extract_description_keywords(text: str, max_terms: int = 3) -> list[str]:
             continue
         if token in CHAT_ITEM_STOPWORDS:
             continue
+        if token in MONTH_KEYWORD_TOKENS:
+            continue
+        if token.isdigit():
+            try:
+                year_val = int(token)
+            except ValueError:
+                year_val = None
+            if year_val and 1900 <= year_val <= 2100:
+                continue
+        else:
+            for suffix in YEAR_TOKEN_SUFFIXES:
+                if token.endswith(suffix) and token[: -len(suffix)].isdigit():
+                    year_val = int(token[: -len(suffix)])
+                    if 1900 <= year_val <= 2100:
+                        break
+            else:
+                year_val = None
+            if year_val:
+                continue
         keywords.append(token)
         if len(keywords) >= max_terms:
             break
@@ -1637,6 +1698,54 @@ def extract_multiplier(prompt: str) -> float | None:
             return float(match.group(1))
         except ValueError:
             return None
+    percent_pattern = re.compile(r"(-?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:%|percent)")
+    increase_terms = (
+        "increase",
+        "increasing",
+        "growth",
+        "grow",
+        "raise",
+        "gain",
+        "improve",
+        "bump",
+        "higher",
+        "up ",
+        "upward",
+    )
+    decrease_terms = (
+        "decrease",
+        "decreasing",
+        "decline",
+        "drop",
+        "reduce",
+        "reduction",
+        "cut",
+        "shrink",
+        "lower",
+        "down ",
+        "downward",
+        "fall",
+    )
+    for pct_match in percent_pattern.finditer(lowered):
+        try:
+            pct_value = float(pct_match.group(1))
+        except ValueError:
+            continue
+        pct_fraction = pct_value / 100.0
+        span_start, span_end = pct_match.span()
+        window_start = max(0, span_start - 24)
+        window_end = min(len(lowered), span_end + 24)
+        window_text = lowered[window_start:window_end]
+        direction = 0
+        if any(term in window_text for term in increase_terms):
+            direction = 1
+        elif any(term in window_text for term in decrease_terms):
+            direction = -1
+        elif "growth rate" in window_text or "growth-rate" in window_text:
+            direction = 1
+        if direction == 0:
+            continue
+        return 1 + pct_fraction * direction
     return None
 
 
@@ -1925,7 +2034,7 @@ def resolve_site_filters(context: dict | None) -> tuple[list[str], bool, bool]:
         flattened.extend(_flatten_filter_values(entry, SITE_VALUE_KEYS))
     normalized = _normalize_filter_tokens(flattened)
     if not normalized:
-        return ["MAIN"], False, False
+        return [], False, True
     if any(_matches_all_token(token, SITE_ALL_TOKENS) for token in normalized):
         return [], True, True
     return normalized, True, False
@@ -1977,6 +2086,24 @@ def gather_scope_keywords(prompt: str, context: dict | None, max_terms: int = 3)
         seen.add(cleaned)
         if len(normalized) >= max_terms:
             break
+    exclude_tokens: set[str] = set()
+
+    def add_exclusion(candidate: Any) -> None:
+        if isinstance(candidate, str):
+            trimmed = candidate.strip().upper()
+            if trimmed:
+                exclude_tokens.add(trimmed)
+
+    if isinstance(context, Mapping):
+        add_exclusion(context.get("item"))
+    if isinstance(entities, Mapping):
+        add_exclusion(entities.get("item"))
+        item_entities = entities.get("items")
+        if isinstance(item_entities, Sequence) and not isinstance(item_entities, (str, bytes)):
+            for entry in item_entities:
+                add_exclusion(entry)
+    if exclude_tokens:
+        normalized = [token for token in normalized if token not in exclude_tokens]
     return normalized
 
 
@@ -2239,6 +2366,110 @@ class UsagePeriod(TypedDict):
     granularity: str
     month: int | None
     year: int
+
+
+AGENT_TRACE_CHAR_LIMIT = 240
+
+
+class AgentTraceEntry(TypedDict, total=False):
+    agent: str
+    action: str
+    details: str
+
+
+def _truncate_agent_text(value: str | None, limit: int = AGENT_TRACE_CHAR_LIMIT) -> str:
+    if not value:
+        return ""
+    text = str(value).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def ensure_agent_trace(context: dict | None) -> list[AgentTraceEntry]:
+    if not isinstance(context, dict):
+        return []
+    trace = context.get("agent_trace")
+    if not isinstance(trace, list):
+        trace = []
+        context["agent_trace"] = trace
+    return trace
+
+
+def append_agent_trace(
+    context: dict | None,
+    agent: str,
+    action: str | None = None,
+    details: str | None = None,
+) -> None:
+    if not isinstance(context, dict):
+        return
+    agent_name = _truncate_agent_text(agent) or "Agent"
+    entry: AgentTraceEntry = {"agent": agent_name}
+    action_text = _truncate_agent_text(action)
+    if action_text:
+        entry["action"] = action_text
+    details_text = _truncate_agent_text(details)
+    if details_text:
+        entry["details"] = details_text
+    trace = ensure_agent_trace(context)
+    trace.append(entry)
+
+
+def format_agent_trace(trace: Sequence[Mapping] | None) -> str | None:
+    if not trace:
+        return None
+    lines: list[str] = []
+    for entry in trace:
+        if not isinstance(entry, Mapping):
+            continue
+        agent = entry.get("agent")
+        if not isinstance(agent, str):
+            continue
+        agent_name = agent.strip() or "Agent"
+        parts: list[str] = []
+        action = entry.get("action")
+        if isinstance(action, str) and action.strip():
+            parts.append(action.strip())
+        details = entry.get("details")
+        if isinstance(details, str) and details.strip():
+            parts.append(details.strip())
+        if not parts:
+            continue
+        lines.append(f"- {agent_name}: {' — '.join(parts)}")
+    if not lines:
+        return None
+    return "Agent collaboration:\n" + "\n".join(lines)
+
+
+def summarize_sql_agent_action(
+    intent: str | None,
+    context: Mapping | None,
+    sql_payload: Mapping | None,
+) -> str:
+    bits: list[str] = []
+    if intent:
+        bits.append(f"intent={intent}")
+    if isinstance(context, Mapping):
+        item_code = context.get("item")
+        if isinstance(item_code, str) and item_code.strip():
+            bits.append(f"item={item_code.strip()}")
+        if context.get("graph_requested"):
+            bits.append("chart_requested")
+    insights = sql_payload.get("insights") if isinstance(sql_payload, Mapping) else None
+    if isinstance(insights, Mapping):
+        period_hint = insights.get("period") or insights.get("period_label")
+        if isinstance(period_hint, str) and period_hint.strip():
+            bits.append(f"period={period_hint.strip()}")
+        row_count = insights.get("row_count")
+        if isinstance(row_count, int) and row_count >= 0:
+            bits.append(f"rows={row_count}")
+    data_rows = sql_payload.get("data") if isinstance(sql_payload, Mapping) else None
+    if isinstance(data_rows, Sequence) and not isinstance(data_rows, (str, bytes, bytearray)):
+        bits.append(f"rows={len(data_rows)}")
+    if isinstance(sql_payload, Mapping) and sql_payload.get("chart"):
+        bits.append("chart_ready")
+    return "; ".join(dict.fromkeys(bits))
 
 
 def extract_recent_month_count(text: str, max_months: int = MAX_USAGE_PERIODS) -> int | None:
@@ -2619,6 +2850,9 @@ def classify_chat_intent(prompt: str) -> str:
 
     has_item_code = bool(extract_item_code(prompt))
     data_request = contains_data_request_keywords(prompt)
+    top_selling_request = mentions_top_selling(prompt)
+    if data_request and top_selling_request:
+        return "sales"
     if data_request and looks_like_all_items_prompt(prompt) and not has_item_code:
         return ALL_ITEMS_INTENT
     if data_request and looks_like_multi_item_prompt(prompt):
@@ -2631,6 +2865,9 @@ def classify_chat_intent(prompt: str) -> str:
         return "report"
     if contains_inventory_intent(prompt):
         return "inventory"
+    if looks_like_small_talk(prompt):
+        # Short greetings without data keywords should stay in chitchat mode.
+        return "chitchat"
     match = ITEM_TOKEN_PATTERN.search(prompt.upper())
     if match:
         token = match.group(0)
@@ -2764,6 +3001,16 @@ BOM_PROMPT_KEYWORDS: tuple[str, ...] = (
     "component list",
     "components of",
     "parts list",
+    "material list",
+    "material breakdown",
+    "materials for",
+    "materials in",
+    "materials are in",
+    "materials used",
+    "materials used in",
+    "what materials",
+    "what materials are in",
+    "what material",
     "what goes into",
     "what go into",
     "goes into",
@@ -2804,6 +3051,24 @@ ALL_ITEMS_SCOPE_KEYWORDS: tuple[str, ...] = (
     "whole list",
     "across the board",
     "across all items",
+)
+
+TOP_SELLING_KEYWORDS: tuple[str, ...] = (
+    "top seller",
+    "top sellers",
+    "top selling",
+    "top selling item",
+    "top selling items",
+    "top selling product",
+    "top selling products",
+    "top selling sku",
+    "top selling skus",
+    "best seller",
+    "best sellers",
+    "best selling",
+    "best selling items",
+    "best selling products",
+    "best selling skus",
 )
 
 ZERO_USAGE_PHRASES: tuple[str, ...] = (
@@ -3020,6 +3285,81 @@ PENDING_ITEM_RESET_KEYWORDS: tuple[str, ...] = (
     "data",
 )
 
+AFFIRMATIVE_RESPONSES: tuple[str, ...] = (
+    "yes",
+    "y",
+    "yep",
+    "yeah",
+    "sure",
+    "sure thing",
+    "please do",
+    "go ahead",
+    "do it",
+    "sounds good",
+    "correct",
+    "right",
+    "ok",
+    "okay",
+)
+NEGATIVE_RESPONSES: tuple[str, ...] = (
+    "no",
+    "n",
+    "nope",
+    "nah",
+    "don't",
+    "do not",
+    "stop",
+    "not now",
+)
+NATURAL_CORRECTION_HINTS: tuple[str, ...] = (
+    "not what i meant",
+    "not what i asked",
+    "not what we asked",
+    "i meant",
+    "i meant to",
+    "i wanted",
+    "meant to say",
+    "meant instead",
+    "should have been",
+    "actually",
+    "instead",
+    "rather than",
+    "wrong intent",
+)
+
+
+def _matches_response(normalized: str, options: tuple[str, ...]) -> bool:
+    for option in options:
+        if normalized == option or normalized.startswith(f"{option} "):
+            return True
+    return False
+
+
+def is_affirmative_reply(prompt: str) -> bool:
+    normalized = " ".join(prompt.lower().split())
+    if not normalized:
+        return False
+    return _matches_response(normalized, AFFIRMATIVE_RESPONSES)
+
+
+def is_negative_reply(prompt: str) -> bool:
+    normalized = " ".join(prompt.lower().split())
+    if not normalized:
+        return False
+    return _matches_response(normalized, NEGATIVE_RESPONSES)
+
+
+def looks_like_natural_correction(prompt: str) -> bool:
+    normalized = " ".join(prompt.lower().split())
+    if len(normalized) < 8:
+        return False
+    for hint in NATURAL_CORRECTION_HINTS:
+        if normalized.startswith(hint):
+            return True
+        if f" {hint} " in normalized or normalized.endswith(f" {hint}"):
+            return True
+    return False
+
 
 def contains_reorder_intent(prompt: str) -> bool:
     return looks_like_reorder_prompt(prompt)
@@ -3087,6 +3427,11 @@ def mentions_plural_item_language(prompt: str) -> bool:
     return any(re.search(rf"\b{re.escape(token)}\b", lowered) for token in PLURAL_ITEM_TOKENS)
 
 
+def mentions_top_selling(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return any(phrase in lowered for phrase in TOP_SELLING_KEYWORDS)
+
+
 def looks_like_all_items_prompt(prompt: str) -> bool:
     lowered = prompt.lower()
     if any(phrase in lowered for phrase in ALL_ITEMS_SCOPE_KEYWORDS):
@@ -3099,6 +3444,8 @@ def looks_like_all_items_prompt(prompt: str) -> bool:
 def looks_like_multi_item_prompt(prompt: str) -> bool:
     lowered = prompt.lower()
     if any(phrase in lowered for phrase in MULTI_ITEM_SCOPE_KEYWORDS):
+        return True
+    if mentions_top_selling(prompt):
         return True
     if mentions_plural_item_language(prompt) and any(
         trigger in lowered for trigger in ("which", "any", "list", "show", "had", "have")
@@ -3389,6 +3736,30 @@ def contains_this_year_reference(prompt: str) -> bool:
     return any(keyword in lowered for keyword in THIS_YEAR_KEYWORDS)
 
 
+RELATIVE_MONTH_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\bthis\s+month\b",
+        r"\bcurrent\s+month\b",
+        r"\bthis\s+period\b",
+        r"\bcurrent\s+period\b",
+        r"\bprior\s+month\b",
+        r"\bprior\s+period\b",
+        r"\bprevious\s+month\b",
+        r"\bprevious\s+period\b",
+        r"\blast\s+month\b",
+        r"\blast\s+period\b",
+    )
+)
+
+
+def references_relative_month(prompt: str) -> bool:
+    if not prompt:
+        return False
+    lowered = prompt.lower()
+    return any(pattern.search(lowered) for pattern in RELATIVE_MONTH_PATTERNS)
+
+
 def mentions_month_range(prompt: str) -> bool:
     if not prompt:
         return False
@@ -3399,13 +3770,17 @@ def mentions_month_range(prompt: str) -> bool:
     month_count = len(month_mentions)
     year_mentions = extract_year_mentions(prompt)
     year_count = len(year_mentions)
+    relative_month_reference = references_relative_month(prompt)
+
+    # If only whole years are referenced in a between/from request, treat it as a
+    # year span (handled elsewhere) instead of forcing a month clarification.
+    if month_count == 0 and not relative_month_reference:
+        return False
 
     def has_multiple_time_refs() -> bool:
         if month_count >= 2:
             return True
         if month_count >= 1 and year_count >= 1:
-            return True
-        if year_count >= 2:
             return True
         return False
 
@@ -3676,6 +4051,7 @@ def build_clarification_question(intent: str, context: dict, today: datetime.dat
     Decide whether we should ask the user clarifying questions before running SQL.
     """
 
+    context.pop("pending_item_confirmation", None)
     action = INTENT_ITEM_ACTIONS.get(intent)
     if not action:
         return None
@@ -3698,6 +4074,7 @@ def build_clarification_question(intent: str, context: dict, today: datetime.dat
         and not inventory_filter_present
     ):
         context["needs_item_for_intent"] = intent
+        context["pending_item_confirmation"] = False
         listed = ", ".join(unique_prompt_candidates[:3])
         if len(unique_prompt_candidates) > 3:
             listed += ", ..."
@@ -3708,9 +4085,11 @@ def build_clarification_question(intent: str, context: dict, today: datetime.dat
 
     if not candidate_item and not inventory_filter_present:
         context["needs_item_for_intent"] = intent
+        context["pending_item_confirmation"] = False
         return f"I'm not sure which item you mean. Before I run that {action}, which item number should I use?"
     if not prompt_has_item and candidate_item and not inventory_filter_present:
         if not followup_same_data:
+            context["pending_item_confirmation"] = True
             return (
                 f"I'm not sure if you're still asking about {candidate_item}. "
                 f"Should I keep using it for this {action}, or is there another item you have in mind?"
@@ -4168,7 +4547,7 @@ def call_openai_reasoner(
     steps_value = parsed.get("steps")
     if isinstance(steps_value, Sequence) and not isinstance(steps_value, (str, bytes, bytearray)):
         clean_steps: list[str] = []
-        for idx, step in enumerate(steps_value[:REASONING_STEP_LIMIT]):
+        for step in steps_value[:REASONING_STEP_LIMIT]:
             if isinstance(step, str):
                 step_text = step.strip()
             else:
@@ -4233,7 +4612,9 @@ def call_openai_interpreter(
         "Data entities you can reference: "
         "InventoryBalance from IV00102 joined to IV00101 with columns ITEMNMBR, ITEMDESC, ITMCLSCD, QTYONHND, ATYALLOC, QTYONORD, ORDRPNTQTY, and computed QtyAvailable (location MAIN by default unless the user specifies sites). "
         "UsageHistory from IV30300 detail + IV30200 header where DOCTYPE=1 and TRXQTY<0 represents consumption; DOCDATE month/year drive reporting windows. "
-        "SalesShipments from SOP30300 detail + SOP30200 header where SOPTYPE=3 invoices (positive) and SOPTYPE=4 returns (negative); summarize the net quantity over DOCDATE windows. "
+        "Usage/burn-rate questions always mean this raw-material consumption view - stick to IV30300/IV30200 so we track negative adjustments only. "
+        "SalesShipments from SOP30300 detail + SOP30200 header where SOPTYPE=3 invoices (positive) and SOPTYPE=4 returns (negative); summarize the net quantity over DOCDATE windows for finished-goods sales. "
+        "Never swap these concepts: usage must not rely on SOP data, and sales/invoice prompts should stay on SOP tables. "
         "ReorderCandidates are items where QtyAvailable < ORDRPNTQTY, and Shortfall = ORDRPNTQTY - QtyAvailable. "
         "Mention the dataset you plan to query inside notes/reply (e.g., 'running usage SQL on IV30300 for Jan 2025'), and rely on session context defaults (item/month/year) when the user says 'same item' or 'same period'."
     )
@@ -4368,6 +4749,7 @@ def interpret_prompt(
     month_guess, year_guess = infer_period_from_text(prompt, today)
     item_followup_hint = looks_like_item_followup(prompt)
     graph_requested = wants_graph(prompt)
+    top_selling_request = mentions_top_selling(prompt)
     context = {
         "intent": classify_chat_intent(prompt),
         "item": extract_item_code(prompt),
@@ -4389,6 +4771,8 @@ def interpret_prompt(
     context["reorder_hint"] = reorder_hint
     context["zero_usage_focus"] = wants_zero_usage_only(prompt)
     baseline_intent = context["intent"]
+    if baseline_intent == "chitchat" and not prompt_item_present and not prompt_has_data_keywords:
+        context["item"] = None
     if reorder_hint:
         baseline_intent = "reorder"
         context["intent"] = "reorder"
@@ -4399,7 +4783,7 @@ def interpret_prompt(
         multi_scope_intent = None
         if not prompt_item_present and looks_like_all_items_prompt(prompt):
             multi_scope_intent = ALL_ITEMS_INTENT
-        elif looks_like_multi_item_prompt(prompt):
+        elif looks_like_multi_item_prompt(prompt) and not top_selling_request:
             multi_scope_intent = MULTI_ITEM_INTENT
         if multi_scope_intent and multi_scope_intent != baseline_intent:
             baseline_intent = multi_scope_intent
@@ -4419,6 +4803,8 @@ def interpret_prompt(
     context["mentions_between_months"] = mentions_month_range(prompt)
     context["mentions_last_year"] = contains_last_year_reference(prompt)
     context["mentions_this_year"] = contains_this_year_reference(prompt)
+    relative_month_reference = references_relative_month(prompt)
+    context["mentions_relative_month"] = relative_month_reference
     if pending_item_intent:
         context["needs_item_for_intent"] = pending_item_intent
         lowered_prompt = prompt.lower()
@@ -4478,6 +4864,42 @@ def interpret_prompt(
                     context["entities"].pop("item", None)
                     context["entities"].pop("item_description", None)
 
+    context_sync_notes: list[str] = []
+    if isinstance(session_context, dict) and session_context:
+        session_bits: list[str] = []
+        for key in ("item", "month", "year"):
+            value = session_context.get(key)
+            if isinstance(value, str):
+                value = value.strip()
+            if value not in (None, "", 0):
+                session_bits.append(f"{key}={value}")
+        if session_bits:
+            context_sync_notes.append("session " + ", ".join(session_bits))
+    if memory_context:
+        memory_bits: list[str] = [f"{len(memory_context)} snippets"]
+        memory_items = []
+        for entry in memory_context:
+            metadata = entry.get("metadata") or {}
+            item_value = metadata.get("item")
+            if isinstance(item_value, str) and item_value.strip():
+                memory_items.append(item_value.strip().upper())
+        unique_items = sorted({item for item in memory_items})
+        if unique_items:
+            preview = ", ".join(unique_items[:2])
+            extra_count = len(unique_items) - 2
+            if extra_count > 0:
+                memory_bits.append(f"items={preview} (+{extra_count} more)")
+            else:
+                memory_bits.append(f"items={preview}")
+        context_sync_notes.append("memory " + ", ".join(memory_bits))
+    if context_sync_notes:
+        append_agent_trace(
+            context,
+            "Context Librarian",
+            "Synchronized active context",
+            " | ".join(context_sync_notes),
+        )
+
     memory_snippets = [entry.get("text") for entry in memory_context or []]
     llm_data = call_openai_interpreter(
         prompt,
@@ -4535,6 +4957,32 @@ def interpret_prompt(
             context["entities"].pop("item_description", None)
     if llm_data.get("reply"):
         context["reply"] = llm_data["reply"]
+    parser_bits: list[str] = []
+    interpreter_intent = llm_data.get("intent")
+    if interpreter_intent:
+        parser_bits.append(f"intent={interpreter_intent}")
+    for key in ("item", "month", "year"):
+        value = llm_data.get(key)
+        if value not in (None, ""):
+            parser_bits.append(f"{key}={value}")
+    if llm_data.get("multiplier") not in (None, 1):
+        parser_bits.append(f"multiplier={llm_data['multiplier']}")
+    entity_snapshot = llm_data.get("entities")
+    if isinstance(entity_snapshot, dict) and entity_snapshot:
+        entity_keys = [str(k) for k in entity_snapshot.keys()]
+        preview = ", ".join(entity_keys[:3])
+        extra = len(entity_keys) - 3
+        if extra > 0:
+            preview = f"{preview} (+{extra} more)"
+        parser_bits.append(f"entities={preview}")
+    if llm_data.get("reply"):
+        parser_bits.append("reply ready")
+    append_agent_trace(
+        context,
+        "Parsing Specialist",
+        "Structured user prompt",
+        "; ".join(parser_bits) if parser_bits else None,
+    )
     if context.get("reorder_hint") and context.get("intent") != "reorder":
         context["intent"] = "reorder"
     if looks_like_inventory_vs_usage_prompt(prompt) and context.get("intent") not in {"reorder", "sales"}:
@@ -4543,6 +4991,21 @@ def interpret_prompt(
         context["needs_item_for_intent"] = None
         if followup_same_data:
             context["prompt_has_item"] = True
+
+    normalized_intent = (context.get("intent") or "").lower()
+    mentions_sales = contains_sales_intent(prompt)
+    mentions_usage = contains_usage_intent(prompt)
+    has_explicit_item = bool(context.get("prompt_has_item") or context.get("item"))
+    if (
+        mentions_sales
+        and has_explicit_item
+        and normalized_intent in {"usage", "report", MULTI_ITEM_INTENT, ALL_ITEMS_INTENT}
+    ):
+        context["intent"] = "sales"
+        normalized_intent = "sales"
+    elif mentions_usage and not mentions_sales and normalized_intent == "sales":
+        context["intent"] = "usage"
+        normalized_intent = "usage"
 
     inventory_filter = detect_inventory_filter(prompt, context)
     if inventory_filter:
@@ -4554,6 +5017,45 @@ def interpret_prompt(
                 entities.pop("item", None)
             context["needs_item_for_intent"] = None
 
+    if (
+        relative_month_reference
+        and not context.get("prompt_period_count")
+        and context.get("intent") == "compare"
+    ):
+        context["month"] = today.month
+        context["year"] = today.year
+        assumption_label = describe_month_year(today.month, today.year, today.year)
+        assumption_note = (
+            f"Using {assumption_label} as the current month based on today's date ({today.isoformat()})."
+        )
+        existing_note = context.get("notes")
+        if isinstance(existing_note, str) and existing_note.strip():
+            if assumption_note not in existing_note:
+                context["notes"] = f"{existing_note.strip()} {assumption_note}".strip()
+        else:
+            context["notes"] = assumption_note
+
+    planner_bits: list[str] = []
+    intent_value = context.get("intent")
+    if intent_value:
+        planner_bits.append(f"intent={intent_value}")
+    item_value = context.get("item")
+    if item_value:
+        planner_bits.append(f"item={item_value}")
+    period_count = context.get("prompt_period_count") or len(context.get("prompt_periods") or [])
+    if period_count:
+        planner_bits.append(f"period_count={period_count}")
+    if context.get("graph_requested"):
+        planner_bits.append("graph requested")
+    multiplier = context.get("multiplier")
+    if multiplier not in (None, 1):
+        planner_bits.append(f"multiplier={multiplier}")
+    append_agent_trace(
+        context,
+        "Planner",
+        "Interpreted prompt",
+        "; ".join(planner_bits) if planner_bits else "Defaulted to usage intent",
+    )
     return context
 
 
@@ -4583,6 +5085,15 @@ def latest_history_entry(history: list[dict], context_type: str | None = None) -
 
 def generate_chitchat_reply(prompt: str, history: list[dict], llm_reply: str | None = None) -> str:
     lowered = prompt.lower()
+    stripped = lowered.strip(" !,.?")
+    greeting_phrases = ("hi", "hello", "hey", "good morning", "good afternoon", "good evening")
+    gratitude_phrases = ("thanks", "thank you", "thx", "appreciate it")
+    if stripped in greeting_phrases:
+        return "Hello! 👋 Ready to dive into GP data whenever you are."
+    if stripped in gratitude_phrases or any(lowered.startswith(f"{phrase} ") for phrase in gratitude_phrases):
+        return "You're welcome! Let me know what item or time frame you'd like to look at next."
+    if "how are you" in lowered or "how's it going" in lowered:
+        return "I'm all set on this side! Just say the word if you want usage, sales, or inventory details."
     conceptual_question = looks_like_conceptual_question(prompt)
     concept_definition = describe_gp_concept(prompt)
 
@@ -4695,7 +5206,9 @@ def build_item_metric_report(
     insight_key: str,
     total_key: str,
     context_type: str,
-    sql_template: str,
+    sql_template: str | None = None,
+    sql_builder: Callable[[pyodbc.Cursor, str, datetime.date, datetime.date], str | None]
+    | None = None,
 ) -> dict:
     context = context or {}
     item_code, suggestions, assumption_note = resolve_item_with_fallbacks(cursor, prompt, context)
@@ -4721,7 +5234,7 @@ def build_item_metric_report(
     combined_start: datetime.date | None = None
     combined_end: datetime.date | None = None
     total_value = 0.0
-    chart_payload: dict | None = None
+    chart_payload: dict | list[dict] | None = None
     chart_caption: str | None = None
     chart_warning: str | None = None
     graph_requested = bool(context.get("graph_requested"))
@@ -4754,7 +5267,14 @@ def build_item_metric_report(
             }
         )
         total_value += metric_value
-        sql_previews.append(format_sql_preview(sql_template, (item_code, start_date, end_date)))
+        if sql_builder:
+            sql_glimpse = sql_builder(cursor, item_code, start_date, end_date)
+        elif sql_template:
+            sql_glimpse = format_sql_preview(sql_template, (item_code, start_date, end_date))
+        else:
+            sql_glimpse = None
+        if sql_glimpse:
+            sql_previews.append(sql_glimpse)
 
     if len(rows) > 1:
         first_label = rows[0]["Period"]
@@ -4785,9 +5305,12 @@ def build_item_metric_report(
             base_metric = 0.0
         scaled_value = base_metric * multiplier
 
-    sql_preview = "\n\n".join(sql_previews)
-    if len(sql_previews) == 1:
+    if not sql_previews:
+        sql_preview = None
+    elif len(sql_previews) == 1:
         sql_preview = sql_previews[0]
+    else:
+        sql_preview = "\n\n".join(sql_previews)
 
     if not period_details:
         period_label = None
@@ -4823,7 +5346,15 @@ def build_item_metric_report(
             insights["burn_rate"] = average_value
 
     if graph_requested:
+        chart_payloads: list[dict] = []
+        caption_bits: list[str] = []
         chart_points: list[dict] = []
+        scaled_chart_points: list[dict] = []
+        scaled_label = None
+        percent_delta: float | None = None
+        if multiplier is not None:
+            scaled_label = f"{column_label} x {multiplier:g}"
+            percent_delta = multiplier - 1.0
         for sequence, detail in enumerate(period_details):
             label = detail.get("label")
             metric_value = detail.get(insight_key)
@@ -4836,20 +5367,55 @@ def build_item_metric_report(
                     "_sequence": sequence,
                 }
             )
+            if scaled_label and multiplier is not None:
+                scaled_chart_points.append(
+                    {
+                        "Period": label,
+                        scaled_label: metric_value * multiplier,
+                        "_sequence": sequence,
+                    }
+                )
         if len(chart_points) >= 2:
-            chart_payload = {
-                "type": "line",
-                "title": f"{item_code} {column_label} trend",
-                "data": chart_points,
-                "x_field": "Period",
-                "y_field": column_label,
-                "value_label": column_label,
-                "item": item_code,
-                "height": 280,
-            }
-            chart_caption = f"Line chart below: {item_code} {column_label.lower()} by period."
+            chart_payloads.append(
+                {
+                    "type": "line",
+                    "title": f"{item_code} {column_label} trend",
+                    "data": chart_points,
+                    "x_field": "Period",
+                    "y_field": column_label,
+                    "value_label": column_label,
+                    "item": item_code,
+                    "height": 280,
+                }
+            )
+            caption_bits.append(f"{item_code} {column_label.lower()} by period.")
         else:
             chart_warning = "I need at least two periods to plot a graph. Try specifying multiple months or a range."
+        if scaled_label and len(scaled_chart_points) >= 2:
+            chart_payloads.append(
+                {
+                    "type": "line",
+                    "title": f"{item_code} {scaled_label} trend",
+                    "data": scaled_chart_points,
+                    "x_field": "Period",
+                    "y_field": scaled_label,
+                    "value_label": scaled_label,
+                    "item": item_code,
+                    "height": 280,
+                }
+            )
+            if percent_delta is not None and abs(percent_delta) >= 0.0001:
+                caption_bits.append(
+                    f"{item_code} {column_label.lower()} adjusted by {percent_delta:+.1%} per period."
+                )
+            else:
+                caption_bits.append(f"{item_code} {scaled_label.lower()} by period.")
+        elif scaled_label and multiplier is not None and not chart_warning:
+            chart_warning = "I need at least two periods to plot a graph. Try specifying multiple months or a range."
+        if chart_payloads:
+            chart_payload = chart_payloads[0] if len(chart_payloads) == 1 else chart_payloads
+            prefix = "Line chart below" if len(chart_payloads) == 1 else "Line charts below"
+            chart_caption = f"{prefix}: {' '.join(caption_bits)}".strip()
 
     result = {
         "data": rows,
@@ -4881,7 +5447,7 @@ def handle_usage_question(
         insight_key="usage",
         total_key="total_usage",
         context_type="usage",
-        sql_template=USAGE_QUERY,
+        sql_builder=build_usage_sql_preview,
     )
 
 
@@ -5114,7 +5680,7 @@ def handle_compare_question(
             }
         )
 
-    sql_preview = format_sql_preview(USAGE_BY_MONTH_QUERY, (item_code, range_start, range_end))
+    sql_preview = build_monthly_usage_sql_preview(cursor, item_code, range_start, range_end)
     difference = None
     percent_change = None
     if len(rows) >= 2:
@@ -5207,7 +5773,7 @@ def handle_why_drop_question(
             }
         )
 
-    sql_preview = format_sql_preview(USAGE_BY_MONTH_QUERY, (item_code, start_date, end_date))
+    sql_preview = build_monthly_usage_sql_preview(cursor, item_code, start_date, end_date)
     recent: UsageTimelineRow | None = rows[-1] if rows else None
     previous: UsageTimelineRow | None = rows[-2] if len(rows) >= 2 else None
     drop_amount = None
@@ -5469,7 +6035,7 @@ def handle_inventory_usage_question(
     if isinstance(avail_value, Number) and isinstance(order_point, Number):
         order_point_gap = avail_value - order_point
 
-    usage_sql = format_sql_preview(USAGE_QUERY, (item_code, start_date, end_date))
+    usage_sql = build_usage_sql_preview(cursor, item_code, start_date, end_date)
     inventory_sql = inventory_payload.get("sql") or ""
     combined_sql = usage_sql if not inventory_sql else f"{inventory_sql}\n\n{usage_sql}"
     base_insights = inventory_payload.get("insights") or {}
@@ -6664,11 +7230,9 @@ def _coerce_snapshot_value(value):
     except AttributeError:  # pragma: no cover - pandas always available
         pd_isna = None
     if pd_isna is not None:
-        try:
+        with _suppress_value_errors():
             if pd_isna(value):
                 return None
-        except Exception:
-            pass
     if isinstance(value, bool):
         return value
     if isinstance(value, int):
@@ -6685,15 +7249,11 @@ def _coerce_snapshot_value(value):
     if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
         return value.isoformat()
     if hasattr(value, "isoformat"):
-        try:
+        with _suppress_value_errors():
             return value.isoformat()  # pandas Timestamp
-        except Exception:
-            pass
     if hasattr(value, "item"):
-        try:
+        with _suppress_value_errors():
             return _coerce_snapshot_value(value.item())
-        except Exception:
-            pass
     return str(value)
 
 
@@ -7074,6 +7634,9 @@ def compose_conversational_message(
     reasoning_section = format_reasoning_for_message(sql_payload.get("reasoning"))
     if reasoning_section:
         reply_sections.append(reasoning_section)
+    agent_section = format_agent_trace(context.get("agent_trace"))
+    if agent_section:
+        reply_sections.append(agent_section)
 
     context_note = build_business_context_note(prompt, context, sql_payload)
     if context_note:
@@ -7093,9 +7656,22 @@ def compose_conversational_message(
         warning_text = chart_warning.strip()
         if warning_text:
             reply_sections.append(warning_text)
+    report_note = sql_payload.get("report_note")
+    if isinstance(report_note, str):
+        report_text = report_note.strip()
+        if report_text:
+            reply_sections.append(report_text)
 
     message = "\n\n".join(part for part in reply_sections if part).strip()
-    footer = CORRECTION_PROMPT_FOOTER if intent != "chitchat" else ""
+    context_type = context.get("context_type")
+    suppress_footer = context.get("suppress_correction_footer")
+    footer = ""
+    if (
+        intent != "chitchat"
+        and context_type not in {"correction", "chitchat"}
+        and not suppress_footer
+    ):
+        footer = CORRECTION_PROMPT_FOOTER
     if footer:
         if message:
             if footer not in message:
@@ -7130,14 +7706,24 @@ def handle_chat_prompt(
     intent = context.get("intent") or classify_chat_intent(prompt)
     clarification = build_clarification_question(intent, context, today)
     if clarification:
+        append_agent_trace(
+            context,
+            "Logic Coach",
+            "Requested clarification",
+            clarification,
+        )
+        context["pending_user_prompt"] = prompt
         return {
             "message": clarification,
             "data": None,
             "sql": None,
             "context_type": "chitchat",
             "context": context,
+            "agent_trace": context.get("agent_trace"),
         }
     context["needs_item_for_intent"] = None
+    context.pop("pending_user_prompt", None)
+    context.pop("pending_item_confirmation", None)
 
     sql_payload: dict | None = None
     if intent == "inventory":
@@ -7164,18 +7750,115 @@ def handle_chat_prompt(
         sql_payload = handle_usage_question(cursor, prompt, today, context)
 
     if sql_payload:
+        sql_action = "Ran custom SQL plan" if intent == CUSTOM_SQL_INTENT else "Ran SQL template"
+        sql_summary = summarize_sql_agent_action(intent, context, sql_payload)
+        append_agent_trace(
+            context,
+            "SQL Analyst",
+            sql_action,
+            sql_summary or None,
+        )
         sanitized_insights = sanitize_insights_for_session(sql_payload.get("insights"))
         if sanitized_insights:
             context["insights"] = sanitized_insights
+            struct_bits: list[str] = []
+            struct_keys = [str(key) for key in sanitized_insights.keys() if key is not None]
+            if struct_keys:
+                preview = ", ".join(struct_keys[:3])
+                extra = len(struct_keys) - 3
+                if extra > 0:
+                    preview = f"{preview} (+{extra} more)"
+                struct_bits.append(f"fields={preview}")
+            row_count = sanitized_insights.get("row_count")
+            if isinstance(row_count, int):
+                struct_bits.append(f"rows={row_count}")
+            append_agent_trace(
+                context,
+                "Structure Architect",
+                "Organized insights snapshot",
+                "; ".join(struct_bits) if struct_bits else None,
+            )
         row_summary = build_row_aggregates(sql_payload.get("data"))
         if row_summary:
             context["row_aggregates"] = row_summary
+            auditor_bits: list[str] = []
+            row_count = row_summary.get("row_count")
+            if isinstance(row_count, int):
+                auditor_bits.append(f"rows={row_count}")
+            numeric_totals = row_summary.get("numeric_totals")
+            if isinstance(numeric_totals, dict) and numeric_totals:
+                total_fields = list(numeric_totals.keys())[:2]
+                auditor_bits.append("totals=" + ", ".join(total_fields))
+            sample_rows = row_summary.get("sample_rows")
+            if isinstance(sample_rows, list) and sample_rows:
+                auditor_bits.append(f"samples={len(sample_rows)}")
+            append_agent_trace(
+                context,
+                "Data Auditor",
+                "Profiled SQL output",
+                "; ".join(auditor_bits) if auditor_bits else None,
+            )
         if not sql_payload.get("error"):
             reasoning_summary = call_openai_reasoner(prompt, today, context, sql_payload)
             if reasoning_summary:
                 sql_payload["reasoning"] = reasoning_summary
                 context["reasoning"] = reasoning_summary
+                conclusion = reasoning_summary.get("conclusion")
+                confidence = reasoning_summary.get("confidence")
+                insight_bits = []
+                if isinstance(conclusion, str) and conclusion.strip():
+                    insight_bits.append(conclusion.strip())
+                if isinstance(confidence, str) and confidence.strip():
+                    insight_bits.append(f"confidence={confidence.strip()}")
+                append_agent_trace(
+                    context,
+                    "Insight Analyst",
+                    "Synthesized findings",
+                    "; ".join(insight_bits) if insight_bits else None,
+                )
+                steps_value = reasoning_summary.get("steps")
+                reasoning_bits: list[str] = []
+                if isinstance(steps_value, Sequence) and not isinstance(steps_value, (str, bytes, bytearray)):
+                    reasoning_bits.append(f"steps={len(steps_value)}")
+                    first_step = steps_value[0] if steps_value else None
+                    if isinstance(first_step, str) and first_step.strip():
+                        reasoning_bits.append(f"first step={first_step.strip()}")
+                append_agent_trace(
+                    context,
+                    "Reasoning Scribe",
+                    "Documented reasoning steps",
+                    "; ".join(reasoning_bits) if reasoning_bits else None,
+                )
+            artifacts, artifact_note = save_report_artifacts(sql_payload, context)
+            if artifacts:
+                sql_payload["report_files"] = artifacts
+                label_values: list[str] = []
+                for attachment in artifacts:
+                    if isinstance(attachment, Mapping):
+                        label = attachment.get("label") or attachment.get("path")
+                        if isinstance(label, str) and label.strip():
+                            label_values.append(label.strip())
+                label_preview = ", ".join(label_values[:2])
+                extra_files = len(label_values) - 2
+                if extra_files > 0:
+                    label_preview = f"{label_preview} (+{extra_files} more)"
+                if not label_preview:
+                    label_preview = f"{len(artifacts)} attachment(s)"
+                append_agent_trace(
+                    context,
+                    "Report Builder",
+                    "Packaged report files",
+                    label_preview,
+                )
+            if artifact_note:
+                sql_payload["report_note"] = artifact_note
 
+    context_type_value = (
+        sql_payload.get("context_type")
+        if sql_payload and sql_payload.get("context_type")
+        else ("chitchat" if intent == "chitchat" else intent)
+    )
+    context["context_type"] = context_type_value
     message = compose_conversational_message(prompt, context, sql_payload, session_history)
     result = {
         "message": message,
@@ -7184,11 +7867,9 @@ def handle_chat_prompt(
         "chart": sql_payload.get("chart") if sql_payload else None,
         "insights": sql_payload.get("insights") if sql_payload else None,
         "reasoning": sql_payload.get("reasoning") if sql_payload else None,
-        "context_type": (
-            sql_payload.get("context_type")
-            if sql_payload and sql_payload.get("context_type")
-            else ("chitchat" if intent == "chitchat" else intent)
-        ),
+        "context_type": context_type_value,
+        "reports": sql_payload.get("report_files") if sql_payload else None,
+        "agent_trace": context.get("agent_trace"),
     }
     if context.get("notes"):
         result["notes"] = context["notes"]
@@ -7231,9 +7912,13 @@ def execute_chat_turn(
             override_context=override_context,
         )
         message = result.get("message", "Done.")
-        if result.get("notes"):
-            message += f"\n\nInterpretation notes: {result['notes']}"
-        message += f"\n\nSource: {server}/{database} via {auth_label}."
+        note_text = result.get("notes")
+        if isinstance(note_text, str):
+            stripped_note = note_text.strip()
+            if stripped_note:
+                message += f"\n\n_(Note: {stripped_note})_"
+        if result.get("data") or result.get("chart"):
+            message += f"\n\nSource: {server}/{database} via {auth_label}."
         return {
             "content": message,
             "sql": result.get("sql"),
@@ -7243,6 +7928,8 @@ def execute_chat_turn(
             "reasoning": result.get("reasoning"),
             "context": result.get("context"),
             "context_type": result.get("context_type"),
+            "reports": result.get("reports"),
+            "agent_trace": result.get("agent_trace"),
         }
     except pyodbc.Error as err:
         return {"content": f"Query failed: {err}", "sql": None, "data": None}
@@ -7332,10 +8019,15 @@ def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> 
             if entry.get("data"):
                 st.dataframe(entry["data"], width="stretch")
             chart_payload = entry.get("chart")
+            chart_entries: list[dict] = []
             if isinstance(chart_payload, dict):
-                chart_data = chart_payload.get("data")
-                x_field = chart_payload.get("x_field") or "Period"
-                y_field = chart_payload.get("y_field")
+                chart_entries = [chart_payload]
+            elif isinstance(chart_payload, list):
+                chart_entries = [payload for payload in chart_payload if isinstance(payload, dict)]
+            for single_chart in chart_entries:
+                chart_data = single_chart.get("data")
+                x_field = single_chart.get("x_field") or "Period"
+                y_field = single_chart.get("y_field")
                 if isinstance(chart_data, list) and chart_data and y_field:
                     chart_df = None
                     try:
@@ -7346,15 +8038,53 @@ def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> 
                         if "_sequence" in chart_df.columns:
                             chart_df = chart_df.sort_values("_sequence")
                         chart_df = chart_df[[x_field, y_field]].copy()
-                        value_label = chart_payload.get("value_label") or y_field
+                        value_label = single_chart.get("value_label") or y_field
                         chart_df = chart_df.rename(columns={y_field: value_label}).set_index(x_field)
-                        title = chart_payload.get("title")
+                        title = single_chart.get("title")
                         if isinstance(title, str) and title.strip():
                             st.caption(title.strip())
                         try:
-                            st.line_chart(chart_df, height=chart_payload.get("height") or 260)
+                            st.line_chart(chart_df, height=single_chart.get("height") or 260)
                         except StreamlitAPIException:
                             st.dataframe(chart_df, width="stretch")
+            agent_trace_value = entry.get("agent_trace")
+            agent_trace_text = format_agent_trace(agent_trace_value) if agent_trace_value else None
+            if agent_trace_text:
+                st.caption(agent_trace_text)
+            report_files = entry.get("reports")
+            if isinstance(report_files, list) and report_files:
+                for report_index, report in enumerate(report_files):
+                    payload_bytes: bytes | None = None
+                    data_value = report.get("data")
+                    if isinstance(data_value, (bytes, bytearray, memoryview)):
+                        payload_bytes = bytes(data_value)
+                    else:
+                        path_value = report.get("path")
+                        if not isinstance(path_value, str):
+                            continue
+                        path_obj = Path(path_value)
+                        if not path_obj.exists():
+                            continue
+                        try:
+                            payload_bytes = path_obj.read_bytes()
+                        except OSError:
+                            continue
+                        report.setdefault("file_name", path_obj.name)
+                    if payload_bytes is None:
+                        continue
+                    file_name = report.get("file_name") or report.get("label") or "report.bin"
+                    mime_type = report.get("mime") or "application/octet-stream"
+                    button_label = report.get("button_label") or f"Download {file_name}"
+                    report_label = report.get("label") or file_name
+                    if report.get("type") == "image":
+                        st.image(payload_bytes, caption=report_label)
+                    st.download_button(
+                        label=button_label,
+                        data=payload_bytes,
+                        file_name=file_name,
+                        mime=mime_type,
+                        key=f"{entry['id']}_report_{report_index}",
+                    )
             if entry["role"] == "assistant":
                 cols = st.columns([0.6, 0.6, 4])
                 with cols[0]:
@@ -7396,24 +8126,30 @@ def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> 
     if not prompt:
         return
 
-    def respond_with_correction_error(message: str) -> None:
+    def append_inline_response(context_type: str, assistant_message: str) -> None:
         history.append(
             {
                 "id": uuid.uuid4().hex,
                 "role": "user",
                 "content": prompt,
-                "context_type": "correction",
+                "context_type": context_type,
             }
         )
         history.append(
             {
                 "id": uuid.uuid4().hex,
                 "role": "assistant",
-                "content": message,
-                "context_type": "correction",
+                "content": assistant_message,
+                "context_type": context_type,
             }
         )
         st.rerun()
+
+    def respond_with_correction_error(message: str) -> None:
+        append_inline_response("correction", message)
+
+    def respond_with_clarification(message: str) -> None:
+        append_inline_response("clarification", message)
 
     normalized = prompt.strip()
     lowered_prompt = normalized.lower()
@@ -7432,13 +8168,56 @@ def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> 
         )
         st.rerun()
 
-    correction_payload: dict | None = None
     prompt_for_execution = prompt
+    clarification_override: dict | None = None
+    pending_intent = session_context.get("needs_item_for_intent")
+    pending_prompt_text = session_context.get("pending_user_prompt")
+    pending_confirmation = bool(session_context.get("pending_item_confirmation"))
+    pending_snapshot = session_context.get("pending_context_snapshot")
+    if pending_intent and pending_prompt_text:
+        if is_affirmative_reply(lowered_prompt):
+            if pending_confirmation:
+                candidate_context = pending_snapshot if isinstance(pending_snapshot, dict) else {}
+                clarification_override = copy.deepcopy(candidate_context)
+                if clarification_override is None:
+                    clarification_override = {}
+                clarification_override.setdefault("intent", pending_intent)
+                clarification_override.setdefault("item", candidate_context.get("item") or session_context.get("item"))
+                clarification_override.setdefault("month", session_context.get("month"))
+                clarification_override.setdefault("year", session_context.get("year"))
+                clarification_override.setdefault("multiplier", session_context.get("multiplier"))
+                if "entities" not in clarification_override:
+                    clarification_override["entities"] = copy.deepcopy(session_context.get("entities") or {})
+                if not clarification_override.get("item"):
+                    respond_with_clarification(
+                        "I'm still not sure which item you want. Let me know the item number so I can run that report."
+                    )
+                    return
+                clarification_override["followup_same_data"] = True
+                clarification_override["prompt_has_item"] = True
+                clarification_override["needs_item_for_intent"] = None
+                clarification_override.pop("pending_item_confirmation", None)
+                clarification_override.pop("pending_user_prompt", None)
+                prompt_for_execution = pending_prompt_text
+            else:
+                respond_with_clarification(
+                    "I still need the specific item number for that request. Just mention the item code so I can continue."
+                )
+                return
+        elif is_negative_reply(lowered_prompt):
+            session_context["pending_item_confirmation"] = False
+            respond_with_clarification("No problem. Which item would you like me to use instead?")
+            return
+
+    correction_payload: dict | None = None
     correction_prefix = next((prefix for prefix in CORRECTION_PREFIXES if lowered_prompt.startswith(prefix)), None)
-    if correction_prefix:
+    natural_correction = False
+    last_assistant_entry = find_last_history_entry(history, "assistant")
+    if not correction_prefix and last_assistant_entry:
+        natural_correction = looks_like_natural_correction(normalized)
+    if correction_prefix or natural_correction:
         parts = normalized.split(":", 1)
         correction_text = parts[1].strip() if len(parts) > 1 else ""
-        last_assistant_entry = find_last_history_entry(history, "assistant")
         if not last_assistant_entry:
             respond_with_correction_error(
                 "I don't have a previous answer to fix yet. Ask a question first, then tell me what to adjust."
@@ -7450,13 +8229,15 @@ def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> 
         if not original_prompt:
             respond_with_correction_error("I couldn't locate the earlier request. Please restate what you'd like me to pull.")
             return
-        if not correction_text:
+        if correction_prefix and not correction_text:
             respond_with_correction_error("Tell me what to change (for example, 'use December too' or 'wrong intent').")
             return
-        prompt_for_execution = f"{original_prompt}\n\nCorrection requested: {correction_text}"
+        correction_instruction = correction_text or normalized
+        prompt_for_execution = f"{original_prompt}\n\nCorrection requested: {correction_instruction}"
+        clarification_override = None
         correction_payload = {
             "original_prompt": original_prompt,
-            "correction_text": correction_text,
+            "correction_text": correction_instruction,
             "target_entry": last_assistant_entry,
             "prompt_for_execution": prompt_for_execution,
         }
@@ -7498,7 +8279,7 @@ def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> 
         active_session["id"],
     )
 
-    override_context = None
+    override_context = clarification_override
     if correction_payload:
         override_context = interpret_prompt(
             prompt_for_execution,
@@ -7508,6 +8289,8 @@ def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> 
             memory_context=memory_context_entries,
             session_context=session_context,
         )
+        if isinstance(override_context, dict):
+            override_context["suppress_correction_footer"] = True
 
     response = execute_chat_turn(
         prompt_for_execution,
@@ -7532,38 +8315,42 @@ def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> 
     )
     if llm_snapshot:
         response["llm_data_snapshot"] = llm_snapshot
-    history.append(
-        {
-            "id": assistant_message_id,
-            "role": "assistant",
-            "content": response.get("content", "Done."),
-            "sql": response.get("sql"),
-            "data": response.get("data"),
-            "chart": response.get("chart"),
-            "insights": response.get("insights"),
-            "reasoning": response.get("reasoning"),
-            "context_type": context_type,
-            "context": response.get("context"),
-            "source_prompt": prompt_for_execution,
-            "llm_data_snapshot": llm_snapshot,
-        }
-    )
-    log_chat_event(
-        {
-            "type": "assistant",
-            "user_id": user_id,
-            "session_id": active_session["id"],
-            "message_id": assistant_message_id,
-            "content": response.get("content"),
-            "context_type": context_type,
-            "sql": response.get("sql"),
-            "chart": response.get("chart"),
-            "context": response.get("context"),
-            "insights": response.get("insights"),
-            "reasoning": response.get("reasoning"),
-            "llm_data_snapshot": llm_snapshot,
-        }
-    )
+        history.append(
+            {
+                "id": assistant_message_id,
+                "role": "assistant",
+                "content": response.get("content", "Done."),
+                "sql": response.get("sql"),
+                "data": response.get("data"),
+                "chart": response.get("chart"),
+                "insights": response.get("insights"),
+                "reasoning": response.get("reasoning"),
+                "context_type": context_type,
+                "context": response.get("context"),
+                "source_prompt": prompt_for_execution,
+                "llm_data_snapshot": llm_snapshot,
+                "reports": response.get("reports"),
+                "agent_trace": response.get("agent_trace"),
+            }
+        )
+        log_chat_event(
+            {
+                "type": "assistant",
+                "user_id": user_id,
+                "session_id": active_session["id"],
+                "message_id": assistant_message_id,
+                "content": response.get("content"),
+                "context_type": context_type,
+                "sql": response.get("sql"),
+                "chart": response.get("chart"),
+                "context": response.get("context"),
+                "insights": response.get("insights"),
+                "reasoning": response.get("reasoning"),
+                "llm_data_snapshot": llm_snapshot,
+                "reports": response.get("reports"),
+                "agent_trace": response.get("agent_trace"),
+            }
+        )
     update_session_context(session_context, response.get("context"))
     record_memory_entry(
         prompt_for_execution,
@@ -7572,6 +8359,19 @@ def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> 
         assistant_message_id,
         user_id=user_id,
     )
+    response_context_snapshot = response.get("context") or {}
+    if response_context_snapshot.get("needs_item_for_intent"):
+        session_context["pending_user_prompt"] = (
+            response_context_snapshot.get("pending_user_prompt") or prompt_for_execution
+        )
+        session_context["pending_item_confirmation"] = bool(
+            response_context_snapshot.get("pending_item_confirmation")
+        )
+        session_context["pending_context_snapshot"] = copy.deepcopy(response_context_snapshot)
+    else:
+        session_context.pop("pending_user_prompt", None)
+        session_context.pop("pending_item_confirmation", None)
+        session_context.pop("pending_context_snapshot", None)
     if correction_payload:
         previous_context = correction_payload["target_entry"].get("context")
         override_used = override_context or response.get("context")
@@ -7649,6 +8449,30 @@ GROUP BY DATEFROMPARTS(YEAR(h.DOCDATE), MONTH(h.DOCDATE), 1),
 ORDER BY PeriodStart;
 """
 
+SALES_BY_MONTH_QUERY = """
+SELECT
+    DATEFROMPARTS(YEAR(h.DOCDATE), MONTH(h.DOCDATE), 1) AS PeriodStart,
+    EOMONTH(h.DOCDATE) AS PeriodEnd,
+    DATENAME(MONTH, h.DOCDATE) + ' ' + CAST(YEAR(h.DOCDATE) AS varchar(4)) AS PeriodLabel,
+    SUM(
+        CASE
+            WHEN l.SOPTYPE = 4 THEN -ABS(l.QUANTITY)
+            ELSE ABS(l.QUANTITY)
+        END
+    ) AS UsageForPeriod
+FROM SOP30300 l
+JOIN SOP30200 h ON h.SOPTYPE = l.SOPTYPE AND h.SOPNUMBE = l.SOPNUMBE
+WHERE l.ITEMNMBR = ?
+  AND l.SOPTYPE IN (3, 4)
+  AND h.DOCDATE BETWEEN ?
+  AND ?
+GROUP BY DATEFROMPARTS(YEAR(h.DOCDATE), MONTH(h.DOCDATE), 1),
+         EOMONTH(h.DOCDATE),
+         DATENAME(MONTH, h.DOCDATE),
+         YEAR(h.DOCDATE)
+ORDER BY PeriodStart;
+"""
+
 REORDER_QUERY = """
 SELECT TOP 25
     i.ITEMNMBR,
@@ -7663,6 +8487,13 @@ SELECT TOP 25
 FROM IV00102 i
 JOIN IV00101 m ON m.ITEMNMBR = i.ITEMNMBR
 """
+
+USAGE_SOURCE_INVENTORY = "inventory"
+USAGE_SOURCE_SALES = "sales"
+RAW_CLASS_HINTS = {"RAW", "RM", "CHEM", "BULK"}
+FINISHED_CLASS_HINTS = {"FG", "FIN", "FERT", "GOOD", "PACK", "FINISHED", "BLEND"}
+ITEM_PROFILE_CACHE: dict[str, dict[str, str | None]] = {}
+ITEM_USAGE_SOURCE_CACHE: dict[str, str] = {}
 
 
 MONTH_INPUT_FORMATS = (
@@ -7773,21 +8604,114 @@ def fetch_items(cursor: pyodbc.Cursor):
     return cursor.fetchall()
 
 
-def fetch_item_description(cursor: pyodbc.Cursor, item_number: str) -> str | None:
+def _normalize_item_code(item_number: str | None) -> str:
+    return (item_number or "").strip().upper()
+
+
+def fetch_item_profile(cursor: pyodbc.Cursor, item_number: str | None) -> dict[str, str | None]:
+    normalized = _normalize_item_code(item_number)
+    if not normalized:
+        return {"description": None, "class_code": None}
+    cached = ITEM_PROFILE_CACHE.get(normalized)
+    if cached:
+        return cached
+
+    description = None
+    class_code = None
     try:
-        cursor.execute("SELECT TOP 1 ITEMDESC FROM IV00101 WHERE ITEMNMBR = ?", item_number)
+        cursor.execute("SELECT TOP 1 ITEMDESC, ITMCLSCD FROM IV00101 WHERE ITEMNMBR = ?", normalized)
         row = cursor.fetchone()
-        if not row:
-            return None
-        if isinstance(row, tuple):
-            return row[0]
-        return getattr(row, "ITEMDESC", None)
+        if row:
+            if isinstance(row, tuple):
+                description = row[0] if len(row) >= 1 else None
+                class_code = row[1] if len(row) >= 2 else None
+            else:
+                description = getattr(row, "ITEMDESC", None)
+                class_code = getattr(row, "ITMCLSCD", None)
     except pyodbc.Error:
+        pass
+
+    profile = {"description": description, "class_code": class_code}
+    ITEM_PROFILE_CACHE[normalized] = profile
+    return profile
+
+
+def fetch_item_description(cursor: pyodbc.Cursor, item_number: str) -> str | None:
+    profile = fetch_item_profile(cursor, item_number)
+    return profile.get("description")
+
+
+def fetch_item_class(cursor: pyodbc.Cursor, item_number: str) -> str | None:
+    profile = fetch_item_profile(cursor, item_number)
+    return profile.get("class_code")
+
+
+def infer_usage_source_from_class(class_code: str | None) -> str | None:
+    if not class_code:
         return None
+    normalized = re.sub(r"[^A-Z0-9]+", " ", class_code.upper())
+    tokens = [token for token in normalized.split() if token]
+    if any(token in RAW_CLASS_HINTS for token in tokens):
+        return USAGE_SOURCE_INVENTORY
+    if any(token in FINISHED_CLASS_HINTS for token in tokens):
+        return USAGE_SOURCE_SALES
+    return None
+
+
+def determine_usage_source(cursor: pyodbc.Cursor, item_number: str) -> str:
+    normalized = _normalize_item_code(item_number)
+    if not normalized:
+        return USAGE_SOURCE_INVENTORY
+    cached = ITEM_USAGE_SOURCE_CACHE.get(normalized)
+    if cached:
+        return cached
+
+    source = infer_usage_source_from_class(fetch_item_class(cursor, normalized))
+    if not source:
+        source = USAGE_SOURCE_INVENTORY
+    ITEM_USAGE_SOURCE_CACHE[normalized] = source
+    return source
+
+
+def resolve_usage_query(
+    cursor: pyodbc.Cursor, item_number: str, start_date: datetime.date, end_date: datetime.date
+) -> tuple[str, tuple]:
+    normalized = _normalize_item_code(item_number)
+    source = determine_usage_source(cursor, normalized)
+    item_param = normalized or item_number
+    if source == USAGE_SOURCE_SALES:
+        return SALES_QUERY, (item_param, start_date, end_date)
+    return USAGE_QUERY, (item_param, start_date, end_date)
+
+
+def build_usage_sql_preview(
+    cursor: pyodbc.Cursor, item_number: str, start_date: datetime.date, end_date: datetime.date
+) -> str | None:
+    query, params = resolve_usage_query(cursor, item_number, start_date, end_date)
+    return format_sql_preview(query, params)
+
+
+def resolve_monthly_usage_query(
+    cursor: pyodbc.Cursor, item_number: str, start_date: datetime.date, end_date: datetime.date
+) -> tuple[str, tuple]:
+    normalized = _normalize_item_code(item_number)
+    source = determine_usage_source(cursor, normalized)
+    item_param = normalized or item_number
+    if source == USAGE_SOURCE_SALES:
+        return SALES_BY_MONTH_QUERY, (item_param, start_date, end_date)
+    return USAGE_BY_MONTH_QUERY, (item_param, start_date, end_date)
+
+
+def build_monthly_usage_sql_preview(
+    cursor: pyodbc.Cursor, item_number: str, start_date: datetime.date, end_date: datetime.date
+) -> str | None:
+    query, params = resolve_monthly_usage_query(cursor, item_number, start_date, end_date)
+    return format_sql_preview(query, params)
 
 
 def fetch_usage(cursor: pyodbc.Cursor, item_number: str, start_date: datetime.date, end_date: datetime.date) -> float:
-    cursor.execute(USAGE_QUERY, item_number, start_date, end_date)
+    query, params = resolve_usage_query(cursor, item_number, start_date, end_date)
+    cursor.execute(query, *params)
     result = cursor.fetchone()
     return float(result[0]) if result and result[0] is not None else 0.0
 
@@ -7901,7 +8825,8 @@ def fetch_monthly_usage(
     start_date: datetime.date,
     end_date: datetime.date,
 ) -> list[dict]:
-    cursor.execute(USAGE_BY_MONTH_QUERY, item_number, start_date, end_date)
+    query, params = resolve_monthly_usage_query(cursor, item_number, start_date, end_date)
+    cursor.execute(query, *params)
     fetched = cursor.fetchall()
     columns = [col[0] for col in cursor.description] if cursor.description else []
     rows: list[dict] = []
@@ -7971,6 +8896,166 @@ def to_csv(data: list[dict]) -> bytes:
     writer.writeheader()
     writer.writerows(data)
     return buffer.getvalue().encode("utf-8")
+
+
+def render_chart_payload_to_png(chart_payload: Mapping[str, Any]) -> bytes | None:
+    chart_type = chart_payload.get("type")
+    if chart_type != "line":
+        return None
+    chart_data = chart_payload.get("data")
+    if not isinstance(chart_data, list) or len(chart_data) < 2:
+        return None
+    x_field = chart_payload.get("x_field") or "Period"
+    y_field = chart_payload.get("y_field")
+    if not isinstance(y_field, str):
+        return None
+    try:
+        chart_df = pd.DataFrame(chart_data)
+    except ValueError:
+        return None
+    if chart_df.empty or x_field not in chart_df.columns or y_field not in chart_df.columns:
+        return None
+    if "_sequence" in chart_df.columns:
+        chart_df = chart_df.sort_values("_sequence")
+    if chart_df.shape[0] < 2:
+        return None
+    x_values = chart_df[x_field].astype(str).tolist()
+    y_values = chart_df[y_field].tolist()
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    ax.plot(x_values, y_values, marker="o", linewidth=1.8)
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+    ax.grid(True, axis="y", linestyle=":", linewidth=0.8)
+    ax.tick_params(axis="x", rotation=45, labelsize=8)
+    ax.set_xlabel(x_field)
+    value_label = chart_payload.get("value_label") or y_field
+    ax.set_ylabel(value_label)
+    title = chart_payload.get("title")
+    if isinstance(title, str) and title.strip():
+        ax.set_title(title.strip())
+    fig.tight_layout()
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=160)
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def slugify_report_component(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    text = re.sub(r"[^A-Za-z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text)
+    return text.strip("_").lower()
+
+
+def build_report_basename(context: dict | None, sql_payload: dict | None) -> str:
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    context = context or {}
+    insights = (sql_payload or {}).get("insights") or {}
+    parts = [
+        slugify_report_component(context.get("item")),
+        slugify_report_component(context.get("intent")),
+    ]
+    period_hint = ""
+    year_value = context.get("year")
+    if year_value:
+        period_hint = slugify_report_component(year_value)
+    elif isinstance(insights.get("period"), str):
+        period_hint = slugify_report_component(insights["period"])
+    elif context.get("month"):
+        try:
+            month_name = calendar.month_abbr[int(context["month"])]
+            period_hint = slugify_report_component(month_name)
+        except (ValueError, TypeError):
+            period_hint = ""
+    if period_hint:
+        parts.append(period_hint)
+    parts.append(timestamp)
+    base = "_".join(part for part in parts if part)
+    return base or f"report_{timestamp}"
+
+
+def save_report_artifacts(
+    sql_payload: dict | None, context: dict | None
+) -> tuple[list[dict], str | None]:
+    if not sql_payload or not isinstance(sql_payload, dict):
+        return [], None
+    context_dict = context if isinstance(context, dict) else {}
+    chart_payload = sql_payload.get("chart")
+    graph_requested = bool(context_dict.get("graph_requested"))
+    if not chart_payload and not graph_requested:
+        return [], None
+    data_rows = sql_payload.get("data")
+    has_rows = isinstance(data_rows, list) and data_rows
+    chart_entries: list[dict] = []
+    if isinstance(chart_payload, dict):
+        chart_entries = [chart_payload]
+    elif isinstance(chart_payload, list):
+        chart_entries = [payload for payload in chart_payload if isinstance(payload, dict)]
+    if not has_rows and not chart_entries:
+        return [], None
+    base_name = build_report_basename(context_dict, sql_payload)
+    attachments: list[dict] = []
+    note_parts: list[str] = []
+
+    if has_rows:
+        fieldnames: list[str] = []
+        for row in data_rows:  # type: ignore[arg-type]
+            if not isinstance(row, Mapping):
+                continue
+            for key in row.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        try:
+            buffer = io.StringIO()
+            writer = csv.DictWriter(buffer, fieldnames=fieldnames or ["Value"])
+            writer.writeheader()
+            for row in data_rows:  # type: ignore[arg-type]
+                if isinstance(row, Mapping):
+                    writer.writerow(row)
+        except OSError as exc:  # pragma: no cover - disk failures
+            logging.warning("Unable to stage CSV attachment: %s", exc)
+        else:
+            csv_bytes = buffer.getvalue().encode("utf-8")
+            csv_name = f"{base_name}.csv"
+            attachments.append(
+                {
+                    "type": "csv",
+                    "data": csv_bytes,
+                    "file_name": csv_name,
+                    "label": csv_name,
+                    "mime": "text/csv",
+                    "button_label": f"Download {csv_name}",
+                }
+            )
+            note_parts.append(csv_name)
+
+    for index, payload in enumerate(chart_entries, start=1):
+        image_bytes = render_chart_payload_to_png(payload)
+        if not image_bytes:
+            continue
+        chart_name = f"{base_name}_chart_{index}.png"
+        title = payload.get("title")
+        label = title.strip() if isinstance(title, str) and title.strip() else chart_name
+        attachments.append(
+            {
+                "type": "image",
+                "data": image_bytes,
+                "file_name": chart_name,
+                "label": label,
+                "mime": "image/png",
+                "button_label": f"Download {chart_name}",
+            }
+        )
+        note_parts.append(label)
+
+    note = None
+    if note_parts:
+        note = "Report downloads ready: " + "; ".join(note_parts)
+    return attachments, note
 
 
 def run_report(month_raw: str) -> None:

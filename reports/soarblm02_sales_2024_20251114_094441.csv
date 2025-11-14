@@ -1,0 +1,14 @@
+Item,Period,StartDate,EndDate,Sales,Description
+SOARBLM02,January 2024,2024-01-01,2024-01-31,4875.0,Soar Bloom Spray                                                                                     
+SOARBLM02,February 2024,2024-02-01,2024-02-29,4300.0,Soar Bloom Spray                                                                                     
+SOARBLM02,March 2024,2024-03-01,2024-03-31,2930.0,Soar Bloom Spray                                                                                     
+SOARBLM02,April 2024,2024-04-01,2024-04-30,3600.0,Soar Bloom Spray                                                                                     
+SOARBLM02,May 2024,2024-05-01,2024-05-31,210.0,Soar Bloom Spray                                                                                     
+SOARBLM02,June 2024,2024-06-01,2024-06-30,2385.0,Soar Bloom Spray                                                                                     
+SOARBLM02,July 2024,2024-07-01,2024-07-31,765.0,Soar Bloom Spray                                                                                     
+SOARBLM02,August 2024,2024-08-01,2024-08-31,0.0,Soar Bloom Spray                                                                                     
+SOARBLM02,September 2024,2024-09-01,2024-09-30,-75.0,Soar Bloom Spray                                                                                     
+SOARBLM02,October 2024,2024-10-01,2024-10-31,1240.0,Soar Bloom Spray                                                                                     
+SOARBLM02,November 2024,2024-11-01,2024-11-30,1620.0,Soar Bloom Spray                                                                                     
+SOARBLM02,December 2024,2024-12-01,2024-12-31,2420.0,Soar Bloom Spray                                                                                     
+SOARBLM02,Total (January 2024 - December 2024),2024-01-01,2024-12-31,24270.0,Soar Bloom Spray                                                                                     

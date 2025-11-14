@@ -7,5 +7,14 @@
     "password_hash": "135b9586104ffca5dfa7ee3ef5c75c8b8f204cae2945ab4182552385fab7478b",
     "created_at": "2025-11-11T21:48:35+00:00",
     "created_via": "self_signup"
+  },
+  {
+    "id": "kipj@chemicaldynamics.com",
+    "email": "kipj@chemicaldynamics.com",
+    "username": "kipj@chemicaldynamics.com",
+    "name": "kipj@chemicaldynamics.com",
+    "password_hash": "24c10d26e712dcc6db2bde6c0446fe21d3f3a7fd5ddbe416390ac519f0619224",
+    "created_at": "2025-11-14T14:06:22+00:00",
+    "created_via": "self_signup"
   }
 ]
