@@ -131,6 +131,10 @@ CHAT_ITEM_STOPWORDS = {
     "PURCHASES",
     "PURCHASING",
     "PURCHASED",
+    "TOP",
+    "SELL",
+    "SELLS",
+    "SELLING",
     "GIVE",
     "GIVES",
     "GIVING",
@@ -168,9 +172,17 @@ CHAT_ITEM_STOPWORDS = {
     "BUILT",
     "INTO",
     "AGAIN",
+    "ALL",
+    "ANY",
+    "EACH",
+    "EVERY",
     "ANOTHER",
     "GROW",
     "GROWTH",
+    "FINISH",
+    "FINISHED",
+    "FINNISHED",
+    "GOODS",
     "RATES",
     "RATE",
 }
@@ -1648,6 +1660,38 @@ def extract_item_code(prompt: str) -> str | None:
     return candidates[0] if candidates else None
 
 
+GENERIC_ITEM_TOKENS: set[str] = {
+    "ALL",
+    "ANY",
+    "EACH",
+    "EVERY",
+    "FINISH",
+    "FINISHED",
+    "FINNISHED",
+    "GOODS",
+}
+
+
+def is_generic_item_code(value: str | None) -> bool:
+    if not isinstance(value, str):
+        return False
+    token = value.strip().upper()
+    return token in GENERIC_ITEM_TOKENS
+
+
+def clear_generic_item_reference(context: dict | None) -> None:
+    if not isinstance(context, dict):
+        return
+    if is_generic_item_code(context.get("item")):
+        context["item"] = None
+    entities = context.get("entities")
+    if isinstance(entities, dict):
+        item_value = entities.get("item")
+        if is_generic_item_code(item_value):
+            entities.pop("item", None)
+            entities.pop("item_description", None)
+
+
 def extract_description_keywords(text: str, max_terms: int = 3) -> list[str]:
     """
     Return up to max_terms keywords from a free-form description.
@@ -2184,6 +2228,8 @@ def update_session_context(session_context: dict, context: dict | None) -> None:
         if key not in context:
             continue
         value = context.get(key)
+        if key == "item" and is_generic_item_code(value):
+            value = None
         if value is None:
             session_context.pop(key, None)
         else:
@@ -2852,6 +2898,8 @@ def classify_chat_intent(prompt: str) -> str:
     data_request = contains_data_request_keywords(prompt)
     top_selling_request = mentions_top_selling(prompt)
     if data_request and top_selling_request:
+        if not has_item_code:
+            return MULTI_ITEM_INTENT
         return "sales"
     if data_request and looks_like_all_items_prompt(prompt) and not has_item_code:
         return ALL_ITEMS_INTENT
@@ -4060,6 +4108,8 @@ def build_clarification_question(intent: str, context: dict, today: datetime.dat
     followup_same_data = bool(context.get("followup_same_data"))
     entities = context.get("entities") or {}
     candidate_item = context.get("item") or entities.get("item")
+    if is_generic_item_code(candidate_item):
+        candidate_item = None
     inventory_filter_present = intent == "inventory" and bool(context.get("inventory_filter"))
     prompt_candidates = context.get("prompt_item_candidates") or []
     unique_prompt_candidates: list[str] = []
@@ -4084,6 +4134,8 @@ def build_clarification_question(intent: str, context: dict, today: datetime.dat
         )
 
     if not candidate_item and not inventory_filter_present:
+        if context.get("top_sales_focus"):
+            return None
         context["needs_item_for_intent"] = intent
         context["pending_item_confirmation"] = False
         return f"I'm not sure which item you mean. Before I run that {action}, which item number should I use?"
@@ -4763,7 +4815,9 @@ def interpret_prompt(
         "multi_intent_warning": detect_multi_intent_usage_conflict(prompt),
         "item_followup_hint": item_followup_hint,
         "graph_requested": graph_requested,
+        "top_sales_focus": False,
     }
+    clear_generic_item_reference(context)
     prompt_item_present = bool(context["item"])
     prompt_has_data_keywords = contains_data_request_keywords(prompt)
     prompt_small_talk = looks_like_small_talk(prompt)
@@ -4783,15 +4837,21 @@ def interpret_prompt(
         multi_scope_intent = None
         if not prompt_item_present and looks_like_all_items_prompt(prompt):
             multi_scope_intent = ALL_ITEMS_INTENT
-        elif looks_like_multi_item_prompt(prompt) and not top_selling_request:
+        elif looks_like_multi_item_prompt(prompt):
             multi_scope_intent = MULTI_ITEM_INTENT
         if multi_scope_intent and multi_scope_intent != baseline_intent:
             baseline_intent = multi_scope_intent
             context["intent"] = multi_scope_intent
+    context["top_sales_focus"] = bool(top_selling_request and not prompt_item_present)
+    if context["top_sales_focus"]:
+        context["intent"] = MULTI_ITEM_INTENT
+        baseline_intent = MULTI_ITEM_INTENT
     context["prompt_has_item"] = prompt_item_present
     if context["followup_same_data"] and context.get("item"):
         context["prompt_has_item"] = True
-    context["prompt_item_candidates"] = extract_item_candidates(prompt)
+    context["prompt_item_candidates"] = [
+        token for token in extract_item_candidates(prompt) if not is_generic_item_code(token)
+    ]
     period_limit = GRAPH_MAX_USAGE_PERIODS if graph_requested else MAX_USAGE_PERIODS
     raw_periods = extract_periods_from_prompt(prompt, today.year)
     prompt_periods = deduplicate_periods(raw_periods, limit=period_limit)
@@ -4834,6 +4894,8 @@ def interpret_prompt(
         and not followup_same_data
         and not item_followup_hint
     )
+    if context.get("top_sales_focus") and not prompt_item_present:
+        allow_item_inheritance = False
 
     if session_context:
         if allow_item_inheritance:
@@ -4849,6 +4911,9 @@ def interpret_prompt(
             if not allow_item_inheritance:
                 context["entities"].pop("item", None)
                 context["entities"].pop("item_description", None)
+            if context.get("prompt_period_count"):
+                context["entities"].pop("periods", None)
+        clear_generic_item_reference(context)
 
     if memory_context:
         for entry in memory_context:
@@ -4863,6 +4928,9 @@ def interpret_prompt(
                 if not allow_item_inheritance:
                     context["entities"].pop("item", None)
                     context["entities"].pop("item_description", None)
+                if context.get("prompt_period_count"):
+                    context["entities"].pop("periods", None)
+        clear_generic_item_reference(context)
 
     context_sync_notes: list[str] = []
     if isinstance(session_context, dict) and session_context:
@@ -4928,6 +4996,9 @@ def interpret_prompt(
             CUSTOM_SQL_INTENT,
         }
         if candidate in allowed_intents:
+            if context.get("top_sales_focus") and not prompt_item_present:
+                if candidate == "sales":
+                    candidate = MULTI_ITEM_INTENT
             if candidate == "inventory" and prior_session_intent in {"usage", "report", "sales"} and followup_same_data:
                 context["intent"] = prior_session_intent
             else:
@@ -4957,6 +5028,7 @@ def interpret_prompt(
             context["entities"].pop("item_description", None)
     if llm_data.get("reply"):
         context["reply"] = llm_data["reply"]
+    clear_generic_item_reference(context)
     parser_bits: list[str] = []
     interpreter_intent = llm_data.get("intent")
     if interpreter_intent:
@@ -5472,34 +5544,52 @@ def handle_multi_item_question(
     cursor: pyodbc.Cursor, prompt: str, today: datetime.date, context: dict | None = None
 ) -> dict:
     context = context or {}
+    top_sales_focus = bool(context.get("top_sales_focus"))
     start_date, end_date, period_label, resolved_periods = determine_scope_period(prompt, context, today)
     site_codes, site_explicit, site_covers_all = resolve_site_filters(context)
     class_filters, class_explicit, class_covers_all = resolve_class_filters(context)
     item_list = resolve_item_list_filters(context)
     keywords = gather_scope_keywords(prompt, context)
-    zero_focus = bool(context.get("zero_usage_focus"))
+    zero_focus = bool(context.get("zero_usage_focus")) and not top_sales_focus
     requested_limit = max(len(item_list), 40) if item_list else 40
-    order_mode = "abs" if zero_focus else "usage"
-    rows, sql_preview = fetch_usage_scope_rows(
-        cursor,
-        start_date,
-        end_date,
-        limit=requested_limit,
-        site_codes=site_codes,
-        site_covers_all=site_covers_all,
-        class_filters=class_filters,
-        class_covers_all=class_covers_all,
-        item_list=item_list,
-        keywords=keywords,
-        order_mode=order_mode,
-    )
-    zero_rows = [row for row in rows if abs(row.get("Usage", 0.0)) < ZERO_USAGE_EPSILON]
-    display_rows = zero_rows if zero_focus and zero_rows else rows
-    error = None
-    if not rows:
-        error = "No items matched those filters."
-    elif zero_focus and not zero_rows:
-        error = f"No items were completely idle during {period_label}."
+    if top_sales_focus:
+        rows, sql_preview = fetch_sales_scope_rows(
+            cursor,
+            start_date,
+            end_date,
+            limit=requested_limit,
+            site_codes=site_codes,
+            site_covers_all=site_covers_all,
+            class_filters=class_filters,
+            class_covers_all=class_covers_all,
+            item_list=item_list,
+            keywords=keywords,
+        )
+        zero_rows: list[dict] = []
+        display_rows = rows
+        error = None if rows else f"No posted sales during {period_label} for those filters."
+    else:
+        order_mode = "abs" if zero_focus else "usage"
+        rows, sql_preview = fetch_usage_scope_rows(
+            cursor,
+            start_date,
+            end_date,
+            limit=requested_limit,
+            site_codes=site_codes,
+            site_covers_all=site_covers_all,
+            class_filters=class_filters,
+            class_covers_all=class_covers_all,
+            item_list=item_list,
+            keywords=keywords,
+            order_mode=order_mode,
+        )
+        zero_rows = [row for row in rows if abs(row.get("Usage", 0.0)) < ZERO_USAGE_EPSILON]
+        display_rows = zero_rows if zero_focus and zero_rows else rows
+        error = None
+        if not rows:
+            error = "No items matched those filters."
+        elif zero_focus and not zero_rows:
+            error = f"No items were completely idle during {period_label}."
     scope_note = build_scope_note(
         site_codes,
         site_explicit,
@@ -5527,7 +5617,10 @@ def handle_multi_item_question(
         "limit": requested_limit,
         "period_start": start_date.isoformat(),
         "period_end": end_date.isoformat(),
+        "top_sales_focus": top_sales_focus,
     }
+    if top_sales_focus:
+        insights["metric_key"] = "sales"
     if scope_note:
         insights["scope_note"] = scope_note
     result = {
@@ -8813,6 +8906,93 @@ def fetch_usage_scope_rows(
                 "Class": getattr(row, "ITMCLSCD", None),
                 "Usage": float(usage_value),
                 "AbsUsage": abs(float(usage_value)),
+            }
+        )
+    sql_preview = format_sql_preview(query, params)
+    return rows, sql_preview
+
+
+def fetch_sales_scope_rows(
+    cursor: pyodbc.Cursor,
+    start_date: datetime.date,
+    end_date: datetime.date,
+    *,
+    limit: int = 40,
+    site_codes: list[str] | None = None,
+    site_covers_all: bool = False,
+    class_filters: list[str] | None = None,
+    class_covers_all: bool = False,
+    item_list: list[str] | None = None,
+    keywords: list[str] | None = None,
+) -> tuple[list[dict], str]:
+    site_codes = site_codes or []
+    class_filters = class_filters or []
+    item_list = [code.strip().upper() for code in item_list or [] if code]
+    keywords = keywords or []
+    scoped_limit = max(1, int(limit)) if limit else 40
+    clauses: list[str] = []
+    params: list = [start_date, end_date]
+
+    if site_covers_all:
+        pass
+    elif site_codes:
+        placeholders = ", ".join("?" for _ in site_codes)
+        clauses.append(f"COALESCE(l.LOCNCODE, '') IN ({placeholders})")
+        params.extend(site_codes)
+    else:
+        pass
+
+    if class_filters and not class_covers_all:
+        class_clause = " OR ".join("m.ITMCLSCD LIKE ?" for _ in class_filters)
+        clauses.append(f"({class_clause})")
+        params.extend(_wildcard_value(value) for value in class_filters)
+
+    if item_list:
+        placeholders = ", ".join("?" for _ in item_list)
+        clauses.append(f"l.ITEMNMBR IN ({placeholders})")
+        params.extend(item_list)
+
+    for keyword in keywords:
+        clauses.append("UPPER(m.ITEMDESC) LIKE ?")
+        params.append(f"%{keyword}%")
+
+    clause_sql = ""
+    if clauses:
+        clause_sql = "\n  AND " + "\n  AND ".join(clauses)
+
+    query = f"""
+    SELECT TOP {scoped_limit}
+        l.ITEMNMBR,
+        m.ITEMDESC,
+        m.ITMCLSCD,
+        SUM(
+            CASE
+                WHEN l.SOPTYPE = 4 THEN -ABS(l.QUANTITY)
+                ELSE ABS(l.QUANTITY)
+            END
+        ) AS SalesQty
+    FROM SOP30300 l
+    JOIN SOP30200 h ON h.SOPTYPE = l.SOPTYPE AND h.SOPNUMBE = l.SOPNUMBE
+    LEFT JOIN IV00101 m ON m.ITEMNMBR = l.ITEMNMBR
+    WHERE h.DOCDATE BETWEEN ? AND ?
+      AND l.SOPTYPE IN (3, 4)
+    {clause_sql}
+    GROUP BY l.ITEMNMBR, m.ITEMDESC, m.ITMCLSCD
+    ORDER BY SalesQty DESC, l.ITEMNMBR;
+    """
+    cursor.execute(query, params)
+    fetched = cursor.fetchall()
+    rows: list[dict] = []
+    for row in fetched:
+        item = getattr(row, "ITEMNMBR", None)
+        sales_value = getattr(row, "SalesQty", 0.0) or 0.0
+        rows.append(
+            {
+                "Item": item,
+                "Description": getattr(row, "ITEMDESC", None),
+                "Class": getattr(row, "ITMCLSCD", None),
+                "Sales": float(sales_value),
+                "AbsSales": abs(float(sales_value)),
             }
         )
     sql_preview = format_sql_preview(query, params)
