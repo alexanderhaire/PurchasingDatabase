@@ -116,8 +116,50 @@ DATASET_REFERENCE_HINTS: tuple[str, ...] = (
     "Sales shipments/invoices require SOP30300 detail joined to SOP30200 headers. SOPTYPE 3 are invoices (positive) and SOPTYPE 4 are returns (negative); DOCDATE comes from SOP30200.",
     "Raw materials always show up as usage/burn-rate data (IV30300/IV30200) and drive buy/reorder reports. Finished goods flow through SOP30300/SOP30200 sales reports, so never mix the two when the user asks for purchasing guidance versus customer shipments.",
     "Open purchase orders require POP10100 headers (PONUMBER, VENDORID, DOCDATE, POSTATUS) joined to POP10110 lines (LOCNCODE, ITEMNMBR, QTYORDER, QTYCANCE, QTYCMTBASE). Outstanding quantity is QTYORDER - (QTYCMTBASE + QTYCANCE).",
+    "Unless a user explicitly asks for finished goods, purchasing queries must filter IV00101.ITMCLSCD to classes that start with 'RAWMAT' (RAWMATNT, RAWMATNTB, RAWMATNTE, RAWMATT) and exclude manufactured/resale classes like MANUFPROT, MANUFPRONT, RESALEPROD, CONTAINERS, or STORAGE.",
 )
 ENFORCE_SQL_ALLOWLIST = False
+
+RAW_MATERIAL_CLASS_PREFIXES: tuple[str, ...] = ("RAWMATNT", "RAWMATNTB", "RAWMATNTE", "RAWMATT")
+FINISHED_GOOD_CLASS_EXAMPLES: tuple[str, ...] = ("MANUFPROT", "MANUFPRONT", "RESALEPROD", "CONTAINERS", "STORAGE")
+PROCUREMENT_KEYWORDS: tuple[str, ...] = (
+    "need to buy",
+    "need to purchase",
+    "need to order",
+    "what to buy",
+    "what should we buy",
+    "reorder point",
+    "re-order point",
+    "below reorder",
+    "below order point",
+    "restock",
+    "replenish",
+    "procurement",
+    "purchasing",
+    "stockout",
+    "stock out",
+    "coverage",
+    "shortfall",
+    "items to purchase",
+    "items to order",
+    "buying list",
+)
+FINISHED_GOOD_OVERRIDE_PHRASES: tuple[str, ...] = (
+    "finished good",
+    "finished goods",
+    "finished product",
+    "finished products",
+    "resale product",
+    "resale products",
+)
+FINISHED_GOOD_NEGATION_PHRASES: tuple[str, ...] = (
+    "exclude finished",
+    "excluding finished",
+    "no finished",
+    "without finished",
+    "not finished",
+    "except finished",
+)
 
 FORBIDDEN_SQL_VERBS = (
     "DELETE",
@@ -135,6 +177,7 @@ FORBIDDEN_SQL_VERBS = (
 
 SQL_COMMENT_PATTERN = re.compile(r"(--.*?$)|(/\*.*?\*/)", re.MULTILINE | re.DOTALL)
 SQL_TABLE_TOKEN_PATTERN = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z0-9_\.\[\]]+)", re.IGNORECASE)
+INVALID_COLUMN_PATTERN = re.compile(r"Invalid column name '([^']+)'")
 MAX_RESULT_ROWS = 400
 SCHEMA_PREVIEW_LIMIT = 20
 HISTORY_WINDOW = 8
@@ -221,9 +264,10 @@ def resolve_openai_settings(secrets: Mapping[str, Any]) -> dict[str, Any]:
         api_key = secrets.get("openai_api_key")
     base_url = section.get("base_url") if isinstance(section, Mapping) else None
     api_version = section.get("api_version") if isinstance(section, Mapping) else None
-    interpreter_model = section.get("interpreter_model") or section.get("model") or DEFAULT_INTERPRETER_MODEL
-    sql_model = section.get("sql_model") or DEFAULT_SQL_MODEL
-    reasoner_model = section.get("reasoner_model") or section.get("analysis_model") or DEFAULT_REASONER_MODEL
+    base_model = section.get("model")
+    interpreter_model = section.get("interpreter_model") or base_model or DEFAULT_INTERPRETER_MODEL
+    sql_model = section.get("sql_model") or base_model or DEFAULT_SQL_MODEL
+    reasoner_model = section.get("reasoner_model") or section.get("analysis_model") or base_model or DEFAULT_REASONER_MODEL
     return {
         "api_key": api_key,
         "base_url": base_url,
@@ -329,6 +373,88 @@ def summarize_history_for_prompt(limit: int = HISTORY_WINDOW) -> str:
         content = entry.get("content", "")
         lines.append(f"{role}: {content.strip()}")
     return "\n".join(lines)
+
+
+ITEM_ENTITY_FIELD_CANDIDATES: tuple[str, ...] = (
+    "item",
+    "items",
+    "item_numbers",
+    "skus",
+    "sku_list",
+    "materials",
+    "products",
+)
+
+
+def _value_has_text(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return any(_value_has_text(entry) for entry in value)
+    return False
+
+
+def _structured_request_has_item(structured_request: Mapping[str, Any] | None) -> bool:
+    if not isinstance(structured_request, Mapping):
+        return False
+    for key in ITEM_ENTITY_FIELD_CANDIDATES:
+        if _value_has_text(structured_request.get(key)):
+            return True
+    entities = structured_request.get("entities")
+    if isinstance(entities, Mapping):
+        for key in ITEM_ENTITY_FIELD_CANDIDATES:
+            if _value_has_text(entities.get(key)):
+                return True
+    return False
+
+
+def _stringify_structured_request(structured_request: Mapping[str, Any] | None) -> str:
+    if not structured_request:
+        return ""
+    try:
+        return json.dumps(structured_request, default=str)
+    except TypeError:
+        return str(structured_request)
+
+
+def _mentions_finished_goods_override(text: str) -> bool:
+    lowered = text.lower()
+    if not any(phrase in lowered for phrase in FINISHED_GOOD_OVERRIDE_PHRASES):
+        return False
+    return not any(negation in lowered for negation in FINISHED_GOOD_NEGATION_PHRASES)
+
+
+def should_enforce_raw_material_scope(
+    *,
+    user_text: str,
+    structured_request: Mapping[str, Any] | None,
+    reasoning_steps: Sequence[str],
+) -> bool:
+    combined_bits = [user_text or "", _stringify_structured_request(structured_request)]
+    if reasoning_steps:
+        combined_bits.append(" ".join(reasoning_steps))
+    combined = " ".join(part for part in combined_bits if part).lower()
+    if not combined.strip():
+        return False
+    if _mentions_finished_goods_override(combined):
+        return False
+    if _structured_request_has_item(structured_request):
+        return False
+    return any(keyword in combined for keyword in PROCUREMENT_KEYWORDS)
+
+
+def sql_plan_targets_raw_materials(sql_plan: SQLPlan | None) -> bool:
+    if not sql_plan or not sql_plan.sql:
+        return False
+    sql_upper = sql_plan.sql.upper()
+    if "ITMCLSCD" not in sql_upper:
+        return False
+    if "RAWMAT" in sql_upper:
+        return True
+    for param in sql_plan.params:
+        if isinstance(param, str) and "RAWMAT" in param.upper():
+            return True
+    return False
 
 
 def call_chat_completion(
@@ -448,6 +574,7 @@ class ReasoningLLM:
         intent: ReasonedIntent,
         schema_summary: str,
         retry_feedback: str | None = None,
+        procurement_scope: bool = False,
     ) -> SQLPlan:
         if ENFORCE_SQL_ALLOWLIST and CUSTOM_SQL_ALLOWED_TABLES:
             table_clause = "Approved tables: " + ", ".join(CUSTOM_SQL_ALLOWED_TABLES) + ". "
@@ -468,9 +595,21 @@ class ReasoningLLM:
             "Structured request JSON:\n" + json.dumps(intent.structured_request, indent=2),
             "Reasoning steps:\n" + "\n".join(f"- {step}" for step in intent.reasoning),
         ]
+        insertion_index = 1
         if DATASET_REFERENCE_HINTS:
             hint_lines = "\n".join(f"- {hint}" for hint in DATASET_REFERENCE_HINTS)
-            sections.insert(1, "Dynamics GP modeling tips:\n" + hint_lines)
+            sections.insert(insertion_index, "Dynamics GP modeling tips:\n" + hint_lines)
+            insertion_index += 1
+        if procurement_scope:
+            guardrail = (
+                "Procurement guardrail:\n"
+                "Join IV00101 to expose ITMCLSCD and limit classes to prefixes starting with 'RAWMAT' "
+                f"({', '.join(RAW_MATERIAL_CLASS_PREFIXES)}). "
+                f"Exclude manufactured/resale classes such as {', '.join(FINISHED_GOOD_CLASS_EXAMPLES)} "
+                "unless the user explicitly asked for finished goods."
+            )
+            sections.insert(insertion_index, guardrail)
+            insertion_index += 1
         if retry_feedback:
             sections.append("Planner feedback:\n" + retry_feedback)
         sections.extend(
@@ -677,7 +816,37 @@ class ReasoningOrchestrator:
     def __init__(self, *, llm: ReasoningLLM, query_runner: QueryRunner, schema: Mapping[str, Any]):
         self.llm = llm
         self.query_runner = query_runner
-        self.schema = schema
+        self.schema = dict(schema or {})
+        self._schema_lookup = {name.upper(): columns for name, columns in self.schema.items()}
+
+    def _column_preview_for_table(self, table: str, limit: int = 15) -> str:
+        columns = self._schema_lookup.get(table.upper()) or []
+        if not columns:
+            return ""
+        preview = [f"{col.get('name')} ({col.get('type')})" for col in columns[:limit]]
+        if len(columns) > limit:
+            preview.append("...")
+        return ", ".join(preview)
+
+    def _build_runtime_retry_feedback(self, sql_plan: SQLPlan, error: pyodbc.Error) -> str:
+        message = str(error)
+        invalid_columns = INVALID_COLUMN_PATTERN.findall(message)
+        table_hints: list[str] = []
+        for table in SQLValidator.extract_tables(sql_plan.sql or ""):
+            preview = self._column_preview_for_table(table)
+            if preview:
+                table_hints.append(f"{table}: {preview}")
+        parts = [
+            "SQL Server rejected the previous query during execution.",
+            f"Error: {message}",
+        ]
+        if invalid_columns:
+            parts.append("Columns mentioned in the error: " + ", ".join(sorted(set(invalid_columns))) + ".")
+        if table_hints:
+            hint_lines = "\n".join(f"- {hint}" for hint in table_hints)
+            parts.append("Schema hints:\n" + hint_lines)
+        parts.append("Rewrite the SQL so it only references existing columns and valid expressions.")
+        return "\n\n".join(part for part in parts if part)
 
     def run_chat_turn(self, user_text: str) -> dict[str, Any]:
         history_text = summarize_history_for_prompt()
@@ -693,6 +862,11 @@ class ReasoningOrchestrator:
         traces.append({"agent": "Interpreter", "details": intent.reasoning})
         if len(traces) > TRACE_LIMIT:
             del traces[: len(traces) - TRACE_LIMIT]
+        procurement_scope = should_enforce_raw_material_scope(
+            user_text=user_text,
+            structured_request=intent.structured_request,
+            reasoning_steps=intent.reasoning,
+        )
         if intent.action == "clarify" and intent.clarifications:
             clarification_text = "\n".join(f"- {q}" for q in intent.clarifications)
             reply = (
@@ -711,13 +885,14 @@ class ReasoningOrchestrator:
         if intent.action == "needs_sql":
             retry_feedback: str | None = None
             validation_error = ""
-            valid = False
+            runtime_error_message = ""
             for attempt in range(2):
                 sql_plan = self.llm.plan_sql(
                     user_text=user_text,
                     intent=intent,
                     schema_summary=schema_summary,
                     retry_feedback=retry_feedback,
+                    procurement_scope=procurement_scope,
                 )
                 traces.append(
                     {
@@ -725,52 +900,111 @@ class ReasoningOrchestrator:
                         "details": [f"Attempt {attempt + 1}: {sql_plan.summary}", *sql_plan.self_checks],
                     }
                 )
-                valid, reason = SQLValidator.validate(sql_plan.sql, CUSTOM_SQL_ALLOWED_TABLES)
-                if valid:
-                    validation_error = ""
+                if not (sql_plan.sql or "").strip():
+                    validation_error = "The SQL planner returned an empty statement."
                     break
-                validation_error = reason or "The SQL validator rejected the query."
-                offending_tables: list[str] = []
-                if "Unapproved tables" in validation_error:
-                    extracted = SQLValidator.extract_tables(sql_plan.sql)
-                    offending_tables = [table for table in extracted if table not in CUSTOM_SQL_ALLOWED_TABLES]
-                if ENFORCE_SQL_ALLOWLIST and offending_tables and attempt == 0:
+                valid, reason = SQLValidator.validate(sql_plan.sql, CUSTOM_SQL_ALLOWED_TABLES)
+                if valid and procurement_scope and not sql_plan_targets_raw_materials(sql_plan):
+                    valid = False
+                    validation_error = (
+                        "Procurement answers must filter IV00101.ITMCLSCD to RAWMAT* classes."
+                    )
                     retry_feedback = (
-                        "These table names are not approved: "
-                        + ", ".join(sorted(set(offending_tables)))
-                        + ". Rewrite the query using only this allowlist: "
-                        + ", ".join(CUSTOM_SQL_ALLOWED_TABLES)
+                        "Join IV00101 to include ITMCLSCD in the result and add a WHERE clause "
+                        "limiting classes to RAWMATNT/RAWMATNTB/RAWMATNTE/RAWMATT while excluding "
+                        "classes such as MANUFPROT, MANUFPRONT, RESALEPROD, CONTAINERS, STORAGE."
                     )
                     traces.append(
                         {
                             "agent": "SQL Validator",
-                            "details": [validation_error, "Retrying SQL planning with stricter instructions."],
+                            "details": [
+                                validation_error,
+                                "Retrying SQL planning with a raw-material filter guardrail.",
+                            ],
                         }
                     )
                     continue
-                break
-            if not valid or not sql_plan:
+                if not valid:
+                    validation_error = reason or "The SQL validator rejected the query."
+                    runtime_error_message = ""
+                    offending_tables: list[str] = []
+                    if "Unapproved tables" in validation_error:
+                        extracted = SQLValidator.extract_tables(sql_plan.sql)
+                        offending_tables = [table for table in extracted if table not in CUSTOM_SQL_ALLOWED_TABLES]
+                    if ENFORCE_SQL_ALLOWLIST and offending_tables and attempt == 0:
+                        retry_feedback = (
+                            "These table names are not approved: "
+                            + ", ".join(sorted(set(offending_tables)))
+                            + ". Rewrite the query using only this allowlist: "
+                            + ", ".join(CUSTOM_SQL_ALLOWED_TABLES)
+                        )
+                        traces.append(
+                            {
+                                "agent": "SQL Validator",
+                                "details": [validation_error, "Retrying SQL planning with stricter instructions."],
+                            }
+                        )
+                        continue
+                    break
+                validation_error = ""
+                runtime_error_message = ""
+                try:
+                    result = self.query_runner.run(sql_plan.sql, sql_plan.params)
+                except pyodbc.ProgrammingError as err:
+                    runtime_error_message = str(err)
+                    retry_feedback = None
+                    details = [
+                        f"Attempt {attempt + 1} failed during execution: {runtime_error_message}",
+                    ]
+                    if attempt == 0:
+                        retry_feedback = self._build_runtime_retry_feedback(sql_plan, err)
+                        details.append("Retrying SQL planning with schema/context feedback.")
+                        traces.append({"agent": "SQL Runner", "details": details})
+                        continue
+                    traces.append({"agent": "SQL Runner", "details": details})
+                    result = None
+                    break
+                except pyodbc.Error as err:
+                    runtime_error_message = str(err)
+                    retry_feedback = None
+                    details = [
+                        f"Attempt {attempt + 1} failed during execution: {runtime_error_message}",
+                    ]
+                    if attempt == 0:
+                        retry_feedback = (
+                            "SQL Server raised an execution error: "
+                            + runtime_error_message
+                            + ". Rewrite the SQL to avoid this failure."
+                        )
+                        details.append("Retrying SQL planning with execution-error context.")
+                        traces.append({"agent": "SQL Runner", "details": details})
+                        continue
+                    traces.append({"agent": "SQL Runner", "details": details})
+                    result = None
+                    break
+                else:
+                    traces.append(
+                        {
+                            "agent": "SQL Runner",
+                            "details": [f"Rows returned: {result.rowcount}", f"Columns: {', '.join(result.columns)}"],
+                        }
+                    )
+                    st.session_state[SESSION_CONTEXT_KEY] = intent.structured_request
+                    break
+            if result is None:
+                if runtime_error_message:
+                    return {
+                        "reply": f"The SQL query failed to run: {runtime_error_message}",
+                        "intent": intent,
+                        "sql_plan": sql_plan,
+                        "result": None,
+                    }
                 return {
                     "reply": f"The SQL planner produced an unsafe query: {validation_error or 'Unknown validation error.'}",
                     "intent": intent,
                     "sql_plan": sql_plan,
                     "result": None,
                 }
-            if not sql_plan.sql:
-                return {
-                    "reply": "I could not create a SQL query for that prompt.",
-                    "intent": intent,
-                    "sql_plan": sql_plan,
-                    "result": None,
-                }
-            result = self.query_runner.run(sql_plan.sql, sql_plan.params)
-            traces.append(
-                {
-                    "agent": "SQL Runner",
-                    "details": [f"Rows returned: {result.rowcount}", f"Columns: {', '.join(result.columns)}"],
-                }
-            )
-            st.session_state[SESSION_CONTEXT_KEY] = intent.structured_request
         reply_text = self.llm.reason_over_results(
             user_text=user_text,
             intent=intent,
