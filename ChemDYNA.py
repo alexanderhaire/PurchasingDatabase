@@ -120,6 +120,21 @@ CHAT_ITEM_STOPWORDS = {
     "ABOVE",
     "BELOW",
     "AVERAGE",
+    "HIGHEST",
+    "LOWEST",
+    "LARGEST",
+    "SMALLEST",
+    "BIGGEST",
+    "MOST",
+    "LEAST",
+    "GREATEST",
+    "FEWEST",
+    "MAXIMUM",
+    "MINIMUM",
+    "PEAK",
+    "BEST",
+    "WORST",
+    "BOTTOM",
     "UNDER",
     "NEED",
     "NEEDS",
@@ -2223,7 +2238,7 @@ def update_session_context(session_context: dict, context: dict | None) -> None:
 
     if not isinstance(session_context, dict) or not isinstance(context, dict):
         return
-    tracked_keys = ("intent", "item", "month", "year", "multiplier", "needs_item_for_intent")
+    tracked_keys = ("intent", "item", "month", "year", "multiplier")
     for key in tracked_keys:
         if key not in context:
             continue
@@ -3311,54 +3326,7 @@ ITEM_FOLLOWUP_PHRASES: tuple[str, ...] = (
     "same one",
     "go with",
 )
-PENDING_ITEM_RESET_KEYWORDS: tuple[str, ...] = (
-    "usage",
-    "report",
-    "summary",
-    "compare",
-    "comparison",
-    "inventory",
-    "reorder",
-    "why",
-    "drop",
-    "decline",
-    "order",
-    "buy",
-    "restock",
-    "stock",
-    "sales",
-    "trend",
-    "history",
-    "table",
-    "data",
-)
 
-AFFIRMATIVE_RESPONSES: tuple[str, ...] = (
-    "yes",
-    "y",
-    "yep",
-    "yeah",
-    "sure",
-    "sure thing",
-    "please do",
-    "go ahead",
-    "do it",
-    "sounds good",
-    "correct",
-    "right",
-    "ok",
-    "okay",
-)
-NEGATIVE_RESPONSES: tuple[str, ...] = (
-    "no",
-    "n",
-    "nope",
-    "nah",
-    "don't",
-    "do not",
-    "stop",
-    "not now",
-)
 NATURAL_CORRECTION_HINTS: tuple[str, ...] = (
     "not what i meant",
     "not what i asked",
@@ -3374,27 +3342,6 @@ NATURAL_CORRECTION_HINTS: tuple[str, ...] = (
     "rather than",
     "wrong intent",
 )
-
-
-def _matches_response(normalized: str, options: tuple[str, ...]) -> bool:
-    for option in options:
-        if normalized == option or normalized.startswith(f"{option} "):
-            return True
-    return False
-
-
-def is_affirmative_reply(prompt: str) -> bool:
-    normalized = " ".join(prompt.lower().split())
-    if not normalized:
-        return False
-    return _matches_response(normalized, AFFIRMATIVE_RESPONSES)
-
-
-def is_negative_reply(prompt: str) -> bool:
-    normalized = " ".join(prompt.lower().split())
-    if not normalized:
-        return False
-    return _matches_response(normalized, NEGATIVE_RESPONSES)
 
 
 def looks_like_natural_correction(prompt: str) -> bool:
@@ -3821,7 +3768,7 @@ def mentions_month_range(prompt: str) -> bool:
     relative_month_reference = references_relative_month(prompt)
 
     # If only whole years are referenced in a between/from request, treat it as a
-    # year span (handled elsewhere) instead of forcing a month clarification.
+    # year span (handled elsewhere) instead of flagging an extra month request.
     if month_count == 0 and not relative_month_reference:
         return False
 
@@ -4081,112 +4028,6 @@ def summarize_session_context(session_context: dict | None, today: datetime.date
     return "; ".join(pieces)
 
 
-INTENT_ITEM_ACTIONS: dict[str, str] = {
-    "usage": "usage report",
-    "report": "usage report",
-    "sales": "sales report",
-    "inventory": "inventory check",
-    "inventory_usage": "inventory vs usage snapshot",
-    "compare": "usage comparison",
-    "why_drop": "drop analysis",
-    MULTI_ITEM_INTENT: "multi-item summary",
-    ALL_ITEMS_INTENT: "all-items summary",
-}
-
-
-def build_clarification_question(intent: str, context: dict, today: datetime.date) -> str | None:
-    """
-    Decide whether we should ask the user clarifying questions before running SQL.
-    """
-
-    context.pop("pending_item_confirmation", None)
-    action = INTENT_ITEM_ACTIONS.get(intent)
-    if not action:
-        return None
-
-    prompt_has_item = bool(context.get("prompt_has_item"))
-    followup_same_data = bool(context.get("followup_same_data"))
-    entities = context.get("entities") or {}
-    candidate_item = context.get("item") or entities.get("item")
-    if is_generic_item_code(candidate_item):
-        candidate_item = None
-    inventory_filter_present = intent == "inventory" and bool(context.get("inventory_filter"))
-    prompt_candidates = context.get("prompt_item_candidates") or []
-    unique_prompt_candidates: list[str] = []
-    for token in prompt_candidates:
-        if token not in unique_prompt_candidates:
-            unique_prompt_candidates.append(token)
-
-    single_item_intents = {"usage", "report", "sales", "compare", "why_drop"}
-    if (
-        intent in single_item_intents
-        and len(unique_prompt_candidates) >= 2
-        and not inventory_filter_present
-    ):
-        context["needs_item_for_intent"] = intent
-        context["pending_item_confirmation"] = False
-        listed = ", ".join(unique_prompt_candidates[:3])
-        if len(unique_prompt_candidates) > 3:
-            listed += ", ..."
-        return (
-            f"I noticed multiple item numbers ({listed}). "
-            f"I'm only able to run one {action} at a time, so which item should I use?"
-        )
-
-    if not candidate_item and not inventory_filter_present:
-        if context.get("top_sales_focus"):
-            return None
-        context["needs_item_for_intent"] = intent
-        context["pending_item_confirmation"] = False
-        return f"I'm not sure which item you mean. Before I run that {action}, which item number should I use?"
-    if not prompt_has_item and candidate_item and not inventory_filter_present:
-        if not followup_same_data:
-            context["pending_item_confirmation"] = True
-            return (
-                f"I'm not sure if you're still asking about {candidate_item}. "
-                f"Should I keep using it for this {action}, or is there another item you have in mind?"
-            )
-
-    period_intents = {"usage", "report", "sales", "compare", MULTI_ITEM_INTENT, ALL_ITEMS_INTENT}
-    if intent not in period_intents:
-        return None
-
-    period_question = build_period_clarification_question(context, today)
-    if period_question:
-        return period_question
-    return None
-
-
-def build_period_clarification_question(context: dict, today: datetime.date) -> str | None:
-    period_count = context.get("prompt_period_count") or 0
-    mentions_between = bool(context.get("mentions_between_months"))
-    mentions_last_year = bool(context.get("mentions_last_year"))
-    mentions_this_year = bool(context.get("mentions_this_year"))
-    month_val = context.get("month")
-    year_val = context.get("year") or today.year
-
-    if mentions_between and period_count < 2:
-        return "You mentioned a range of months. Tell me the exact start and end months you'd like me to use."
-
-    if mentions_last_year:
-        if month_val:
-            current_label = describe_month_year(month_val, year_val, today.year)
-            prior_label = describe_month_year(month_val, year_val - 1, today.year - 1)
-            if mentions_this_year:
-                return (
-                    f"You mentioned both this year and last year. "
-                    f"Should I compare {current_label} against {prior_label}, "
-                    "or just pull last year's month as the basis? "
-                    "Let me know by restating the option you want."
-                )
-            return (
-                f"Should I pull last year's {prior_label} usage for reference, "
-                f"or compare it directly with {current_label}? "
-                "Please clarify which result you need."
-            )
-        return "You mentioned last year's usage. Which month should I use for that comparison?"
-
-    return None
 
 
 def infer_period_from_text(prompt: str, today: datetime.date) -> tuple[int, int]:
@@ -4797,7 +4638,6 @@ def interpret_prompt(
     session_context: dict | None = None,
 ) -> dict:
     prior_session_intent = session_context.get("intent") if isinstance(session_context, dict) else None
-    pending_item_intent = session_context.get("needs_item_for_intent") if isinstance(session_context, dict) else None
     month_guess, year_guess = infer_period_from_text(prompt, today)
     item_followup_hint = looks_like_item_followup(prompt)
     graph_requested = wants_graph(prompt)
@@ -4865,19 +4705,6 @@ def interpret_prompt(
     context["mentions_this_year"] = contains_this_year_reference(prompt)
     relative_month_reference = references_relative_month(prompt)
     context["mentions_relative_month"] = relative_month_reference
-    if pending_item_intent:
-        context["needs_item_for_intent"] = pending_item_intent
-        lowered_prompt = prompt.lower()
-        if not prompt_item_present and any(keyword in lowered_prompt for keyword in PENDING_ITEM_RESET_KEYWORDS):
-            context["needs_item_for_intent"] = None
-            pending_item_intent = None
-        elif prompt_item_present:
-            context["needs_item_for_intent"] = None
-    followup_item_response = bool(pending_item_intent and prompt_item_present and item_followup_hint)
-    if followup_item_response:
-        baseline_intent = pending_item_intent
-        context["intent"] = pending_item_intent
-        context["followup_same_data"] = True
 
     followup_same_data = bool(context["followup_same_data"])
     if followup_same_data:
@@ -5059,10 +4886,8 @@ def interpret_prompt(
         context["intent"] = "reorder"
     if looks_like_inventory_vs_usage_prompt(prompt) and context.get("intent") not in {"reorder", "sales"}:
         context["intent"] = "inventory_usage"
-    if context.get("item"):
-        context["needs_item_for_intent"] = None
-        if followup_same_data:
-            context["prompt_has_item"] = True
+    if context.get("item") and followup_same_data:
+        context["prompt_has_item"] = True
 
     normalized_intent = (context.get("intent") or "").lower()
     mentions_sales = contains_sales_intent(prompt)
@@ -5087,7 +4912,6 @@ def interpret_prompt(
             entities = context.get("entities")
             if isinstance(entities, dict):
                 entities.pop("item", None)
-            context["needs_item_for_intent"] = None
 
     if (
         relative_month_reference
@@ -7797,27 +7621,6 @@ def handle_chat_prompt(
             session_context=session_context,
         )
     intent = context.get("intent") or classify_chat_intent(prompt)
-    clarification = build_clarification_question(intent, context, today)
-    if clarification:
-        append_agent_trace(
-            context,
-            "Logic Coach",
-            "Requested clarification",
-            clarification,
-        )
-        context["pending_user_prompt"] = prompt
-        return {
-            "message": clarification,
-            "data": None,
-            "sql": None,
-            "context_type": "chitchat",
-            "context": context,
-            "agent_trace": context.get("agent_trace"),
-        }
-    context["needs_item_for_intent"] = None
-    context.pop("pending_user_prompt", None)
-    context.pop("pending_item_confirmation", None)
-
     sql_payload: dict | None = None
     if intent == "inventory":
         sql_payload = handle_inventory_question(cursor, prompt, context)
@@ -8241,9 +8044,6 @@ def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> 
     def respond_with_correction_error(message: str) -> None:
         append_inline_response("correction", message)
 
-    def respond_with_clarification(message: str) -> None:
-        append_inline_response("clarification", message)
-
     normalized = prompt.strip()
     lowered_prompt = normalized.lower()
     if lowered_prompt in RESET_COMMANDS:
@@ -8262,46 +8062,6 @@ def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> 
         st.rerun()
 
     prompt_for_execution = prompt
-    clarification_override: dict | None = None
-    pending_intent = session_context.get("needs_item_for_intent")
-    pending_prompt_text = session_context.get("pending_user_prompt")
-    pending_confirmation = bool(session_context.get("pending_item_confirmation"))
-    pending_snapshot = session_context.get("pending_context_snapshot")
-    if pending_intent and pending_prompt_text:
-        if is_affirmative_reply(lowered_prompt):
-            if pending_confirmation:
-                candidate_context = pending_snapshot if isinstance(pending_snapshot, dict) else {}
-                clarification_override = copy.deepcopy(candidate_context)
-                if clarification_override is None:
-                    clarification_override = {}
-                clarification_override.setdefault("intent", pending_intent)
-                clarification_override.setdefault("item", candidate_context.get("item") or session_context.get("item"))
-                clarification_override.setdefault("month", session_context.get("month"))
-                clarification_override.setdefault("year", session_context.get("year"))
-                clarification_override.setdefault("multiplier", session_context.get("multiplier"))
-                if "entities" not in clarification_override:
-                    clarification_override["entities"] = copy.deepcopy(session_context.get("entities") or {})
-                if not clarification_override.get("item"):
-                    respond_with_clarification(
-                        "I'm still not sure which item you want. Let me know the item number so I can run that report."
-                    )
-                    return
-                clarification_override["followup_same_data"] = True
-                clarification_override["prompt_has_item"] = True
-                clarification_override["needs_item_for_intent"] = None
-                clarification_override.pop("pending_item_confirmation", None)
-                clarification_override.pop("pending_user_prompt", None)
-                prompt_for_execution = pending_prompt_text
-            else:
-                respond_with_clarification(
-                    "I still need the specific item number for that request. Just mention the item code so I can continue."
-                )
-                return
-        elif is_negative_reply(lowered_prompt):
-            session_context["pending_item_confirmation"] = False
-            respond_with_clarification("No problem. Which item would you like me to use instead?")
-            return
-
     correction_payload: dict | None = None
     correction_prefix = next((prefix for prefix in CORRECTION_PREFIXES if lowered_prompt.startswith(prefix)), None)
     natural_correction = False
@@ -8327,7 +8087,6 @@ def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> 
             return
         correction_instruction = correction_text or normalized
         prompt_for_execution = f"{original_prompt}\n\nCorrection requested: {correction_instruction}"
-        clarification_override = None
         correction_payload = {
             "original_prompt": original_prompt,
             "correction_text": correction_instruction,
@@ -8372,7 +8131,7 @@ def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> 
         active_session["id"],
     )
 
-    override_context = clarification_override
+    override_context: dict | None = None
     if correction_payload:
         override_context = interpret_prompt(
             prompt_for_execution,
@@ -8452,19 +8211,6 @@ def render_sql_chat(today: datetime.date, user_override: dict | None = None) -> 
         assistant_message_id,
         user_id=user_id,
     )
-    response_context_snapshot = response.get("context") or {}
-    if response_context_snapshot.get("needs_item_for_intent"):
-        session_context["pending_user_prompt"] = (
-            response_context_snapshot.get("pending_user_prompt") or prompt_for_execution
-        )
-        session_context["pending_item_confirmation"] = bool(
-            response_context_snapshot.get("pending_item_confirmation")
-        )
-        session_context["pending_context_snapshot"] = copy.deepcopy(response_context_snapshot)
-    else:
-        session_context.pop("pending_user_prompt", None)
-        session_context.pop("pending_item_confirmation", None)
-        session_context.pop("pending_context_snapshot", None)
     if correction_payload:
         previous_context = correction_payload["target_entry"].get("context")
         override_used = override_context or response.get("context")
@@ -9306,6 +9052,20 @@ st.write(
     "To Help you Grow "
     "Interpreter handles the reasoning and logic, then the app runs the SQL locally and securely."
 )
+
+default_report_month = datetime.date.today().strftime("%B %Y")
+st.subheader("Historical usage report")
+with st.form("historical_usage_report_form"):
+    report_month = st.text_input(
+        "Month to analyze",
+        value=default_report_month,
+        help="Enter values like 'July 2024', '2024-07', or leave as-is for the current month.",
+    )
+    run_report_submit = st.form_submit_button("Run usage report", use_container_width=True)
+if run_report_submit:
+    run_report(report_month or default_report_month)
+
+st.divider()
 
 today_global = datetime.date.today()
 render_sql_chat(today_global, current_user)
